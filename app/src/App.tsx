@@ -6,12 +6,20 @@ import { NEWS_ECONOMY_TEMPLATE, NEWS_EXTRA_TEMPLATE } from './templates'
 import { downloadJson, readJsonFile } from './domain/file'
 import { uid } from './domain/uid'
 
-type ProgramId = 'news_extra' | 'news_economy'
+type ProgramId = string
 
-const PROGRAMS: Array<{ id: ProgramId; name: string; template: Template }> = [
-  { id: 'news_extra', name: '뉴스외전', template: NEWS_EXTRA_TEMPLATE },
-  { id: 'news_economy', name: '뉴스와 경제', template: NEWS_ECONOMY_TEMPLATE },
+type ProgramDef = { id: ProgramId; name: string; builtIn: boolean; template?: Template }
+
+const BUILTIN_PROGRAMS: ProgramDef[] = [
+  { id: 'news_extra', name: '뉴스외전', builtIn: true, template: NEWS_EXTRA_TEMPLATE },
+  { id: 'news_economy', name: '뉴스와 경제', builtIn: true, template: NEWS_ECONOMY_TEMPLATE },
+  { id: 'news_12', name: '12시뉴스', builtIn: true },
+  { id: 'news_930', name: '930뉴스', builtIn: true },
+  { id: 'news_desk', name: '뉴스데스크', builtIn: true },
+  { id: 'news_25', name: '뉴스25', builtIn: true },
 ]
+
+const PROGRAMS_KEY = 'newstimekeeper:programs:v1'
 
 const DEFAULT_DURATION_BY_CATEGORY: Record<string, number> = {
   완제: 90,
@@ -51,7 +59,28 @@ function nowClockHHMMSS() {
   return `${hh}:${mm}:${ss}`
 }
 
-function createEmptyRundown(p: (typeof PROGRAMS)[number]): Rundown {
+function toAsciiSlug(input: string): string {
+  return input
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, '_')
+    .replace(/[^a-z0-9_-]/g, '')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '')
+}
+
+function autoProgramId(name: string, existing: Set<string>): string {
+  const slug = toAsciiSlug(name)
+  if (slug && !existing.has(slug)) return slug
+  const base = slug ? `news_${slug}` : 'news'
+  if (!existing.has(base)) return base
+  // Guaranteed-unique fallback (stable enough for local use)
+  let id = `${base}_${uid('p_').replace(/[^a-z0-9_-]/gi, '')}`
+  while (existing.has(id)) id = `${base}_${uid('p_').replace(/[^a-z0-9_-]/gi, '')}`
+  return id
+}
+
+function createEmptyRundown(p: Pick<ProgramDef, 'id' | 'name'>): Rundown {
   const marker: RundownItem = { id: uid('m_'), kind: 'marker', title: '뉴스끝', includeInRun: false }
   return {
     schemaVersion: '1.0',
@@ -147,6 +176,9 @@ function App() {
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const [focusItemId, setFocusItemId] = useState<string | null>(null)
   const [selectedItemId, setSelectedItemId] = useState<string | null>(null)
+  const pinnedFooterRef = useRef<HTMLDivElement | null>(null)
+  const [pinnedFooterHeight, setPinnedFooterHeight] = useState<number>(0)
+  const [nowMs, setNowMs] = useState<number>(() => Date.now())
   const [play, setPlay] = useState<PlaySession>({
     state: 'idle',
     currentIncludedIndex: 0,
@@ -157,8 +189,26 @@ function App() {
 
   const [newsStartDraft, setNewsStartDraft] = useState<string>('20:00:00')
   const [scheduledDraft, setScheduledDraft] = useState<string>('51:00')
-  const [autoFollow, setAutoFollow] = useState<boolean>(true)
   const tableScrollRef = useRef<HTMLDivElement | null>(null)
+
+  const [programs, setPrograms] = useState<ProgramDef[]>(() => {
+    try {
+      const raw = localStorage.getItem(PROGRAMS_KEY)
+      const parsed = raw ? (JSON.parse(raw) as Array<{ id: string; name: string }>) : []
+      const custom: ProgramDef[] = parsed
+        .filter((p) => typeof p?.id === 'string' && typeof p?.name === 'string')
+        .map((p) => ({ id: p.id, name: p.name, builtIn: false }))
+      return [...BUILTIN_PROGRAMS, ...custom]
+    } catch {
+      return [...BUILTIN_PROGRAMS]
+    }
+  })
+  const [newProgramNameDraft, setNewProgramNameDraft] = useState<string>('')
+
+  function persistCustomPrograms(nextPrograms: ProgramDef[]) {
+    const custom = nextPrograms.filter((p) => !p.builtIn).map((p) => ({ id: p.id, name: p.name }))
+    localStorage.setItem(PROGRAMS_KEY, JSON.stringify(custom))
+  }
 
   const selectedIndex = useMemo(() => {
     if (!rundown || !selectedItemId) return null
@@ -179,6 +229,46 @@ function App() {
     })
     return () => window.cancelAnimationFrame(raf)
   }, [focusItemId])
+
+  useEffect(() => {
+    const el = pinnedFooterRef.current
+    if (!el) return
+    const ro = new ResizeObserver(() => {
+      setPinnedFooterHeight(Math.ceil(el.getBoundingClientRect().height))
+    })
+    ro.observe(el)
+    setPinnedFooterHeight(Math.ceil(el.getBoundingClientRect().height))
+    return () => ro.disconnect()
+  }, [])
+
+  useEffect(() => {
+    if (play.state === 'idle') return
+    const t = window.setInterval(() => {
+      setNowMs(Date.now())
+    }, 200)
+    return () => window.clearInterval(t)
+  }, [play.state])
+
+  // Keep selected row visible in the scroll container
+  useEffect(() => {
+    if (!selectedItemId) return
+    const container = tableScrollRef.current
+    if (!container) return
+    const el = document.getElementById(`row-${selectedItemId}`) as HTMLElement | null
+    if (!el) return
+
+    const raf = window.requestAnimationFrame(() => {
+      const c = container.getBoundingClientRect()
+      const r = el.getBoundingClientRect()
+      const padding = 12
+      const above = r.top < c.top + padding
+      const below = r.bottom > c.bottom - padding
+      if (!above && !below) return
+      // Use scrollIntoView with container-friendly options
+      el.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+    })
+    return () => window.cancelAnimationFrame(raf)
+  }, [selectedItemId])
 
   useEffect(() => {
     if (!rundown) return
@@ -258,10 +348,24 @@ function App() {
 
   const includedRows = useMemo(() => {
     if (!computed) return []
-    return computed.rows.filter((r) => r.isIncluded && r.item.kind === 'newsItem') as Array<
-      (typeof computed.rows)[number] & { item: Extract<RundownItem, { kind: 'newsItem' }> }
+    return computed.rows.filter((r) => r.isIncluded && (r.item.kind === 'newsItem' || r.item.kind === 'sectionHeader')) as Array<
+      (typeof computed.rows)[number] & { item: Extract<RundownItem, { kind: 'newsItem' | 'sectionHeader' }> }
     >
   }, [computed])
+
+  const elapsedRunSeconds = useMemo(() => {
+    if (play.state === 'idle') return 0
+    if (includedRows.length === 0) return 0
+    const idx = Math.min(play.currentIncludedIndex, includedRows.length - 1)
+    const completed = includedRows.slice(0, idx).reduce((acc, r) => acc + (r.item.durationSeconds ?? 0), 0)
+
+    const baseStartedAt = play.itemStartedAtMs ?? nowMs
+    const effectiveNow = play.state === 'paused' ? play.pausedAtMs ?? nowMs : nowMs
+    const elapsedMs = Math.max(0, effectiveNow - baseStartedAt - play.pausedAccumulatedMs)
+    const currentDur = includedRows[idx]?.item.durationSeconds ?? 0
+    const inCurrent = Math.min(currentDur, Math.floor(elapsedMs / 1000))
+    return completed + inCurrent
+  }, [includedRows, nowMs, play.currentIncludedIndex, play.itemStartedAtMs, play.pausedAccumulatedMs, play.pausedAtMs, play.state])
 
   const selectedRow = useMemo(() => {
     if (!computed || !selectedItemId) return null
@@ -317,15 +421,6 @@ function App() {
     return () => window.clearInterval(t)
   }, [play.state, includedRows])
 
-  function setFromTemplate(p: (typeof PROGRAMS)[number]) {
-    const rd = cloneTemplateToRundown(p.template)
-    setProgramId(p.id)
-    setRundown(rd)
-    localStorage.setItem(storageKeyForRundown(p.id), JSON.stringify(rd))
-    setPlay({ state: 'idle', currentIncludedIndex: 0, itemStartedAtMs: null, pausedAtMs: null, pausedAccumulatedMs: 0 })
-    setSelectedItemId(null)
-  }
-
   function setRundownSafe(updater: (prev: Rundown) => Rundown) {
     setRundown((prev) => {
       if (!prev) return prev
@@ -364,7 +459,7 @@ function App() {
     }
   }
 
-  function onPickProgram(p: (typeof PROGRAMS)[number]) {
+  function onPickProgram(p: ProgramDef) {
     // B안: 프로그램 선택 화면 → 동일 메인 화면.
     // 요구사항: "템플릿 저장"을 해두면 열 때마다 템플릿이 자동으로 열린다.
     const storedTemplate = loadTemplateFromStorage(p.id)
@@ -406,6 +501,39 @@ function App() {
     downloadJson(filename, rundown)
   }
 
+  function exportTemplate() {
+    if (!rundown || !programId) return
+    const t = rundownToTemplate(rundown)
+    const filename = `template_${t.programId}_${uid('x_')}.json`
+    downloadJson(filename, t)
+  }
+
+  async function onImportJsonFile(file: File) {
+    const parsed = await readJsonFile<any>(file)
+    if (parsed?.type === 'rundown') {
+      await onImportRundownFile(file)
+      return
+    }
+    if (parsed?.type === 'template') {
+      const t = normalizeTemplate(parsed as Template)
+      const pId = t.programId as ProgramId
+      localStorage.setItem(storageKeyForTemplate(pId), JSON.stringify(t))
+      // Apply immediately?
+      if (confirm('템플릿을 저장했습니다. 지금 바로 이 템플릿으로 큐시트를 열까요?')) {
+        const rd = cloneTemplateToRundown(t)
+        setProgramId(pId)
+        setRundown(rd)
+        localStorage.setItem(storageKeyForRundown(pId), JSON.stringify(rd))
+        setPlay({ state: 'idle', currentIncludedIndex: 0, itemStartedAtMs: null, pausedAtMs: null, pausedAccumulatedMs: 0 })
+        setSelectedItemId(null)
+      } else {
+        alert('템플릿을 저장했습니다. 다음에 프로그램을 열면 자동으로 이 템플릿이 열립니다.')
+      }
+      return
+    }
+    throw new Error('지원하지 않는 파일 형식입니다. (rundown/template JSON만 가능)')
+  }
+
   function saveCurrentAsTemplate() {
     if (!rundown || !programId) return
     const t = rundownToTemplate(rundown)
@@ -426,11 +554,31 @@ function App() {
       timing: { ...prev.timing, newsStartTime: clock },
     }))
     setNewsStartDraft(clock)
-    setAutoFollow(true)
+    const now = Date.now()
+    // Compute start index from the rundown itself to avoid stale derived lists.
+    const runnable: Array<Extract<RundownItem, { kind: 'newsItem' | 'sectionHeader' }>> = []
+    let afterEnd = false
+    for (const it of rundown.items) {
+      if (it.kind === 'marker' && it.title === '뉴스끝') {
+        afterEnd = true
+      }
+      if (afterEnd) continue
+      if ((it.kind === 'newsItem' || it.kind === 'sectionHeader') && it.includeInRun) {
+        runnable.push(it)
+      }
+    }
+    let firstIdx = 0
+    for (let i = 0; i < runnable.length; i += 1) {
+      const dur = runnable[i]?.durationSeconds ?? 0
+      if (dur > 0) {
+        firstIdx = i
+        break
+      }
+    }
     setPlay({
       state: 'running',
-      currentIncludedIndex: 0,
-      itemStartedAtMs: Date.now(),
+      currentIncludedIndex: Math.min(firstIdx, Math.max(0, runnable.length - 1)),
+      itemStartedAtMs: now,
       pausedAtMs: null,
       pausedAccumulatedMs: 0,
     })
@@ -459,13 +607,33 @@ function App() {
   }
 
   function nextItemNow() {
+    const now = Date.now()
+    // If we are currently playing (or paused), "commit" actual elapsed time to the current item duration.
+    if (play.state !== 'idle' && includedRows.length > 0) {
+      const idx = Math.min(play.currentIncludedIndex, includedRows.length - 1)
+      const current = includedRows[idx]?.item
+      if (current && (current.kind === 'newsItem' || current.kind === 'sectionHeader')) {
+        const baseStartedAt = play.itemStartedAtMs ?? now
+        const effectiveNow = play.state === 'paused' ? play.pausedAtMs ?? now : now
+        const elapsedMs = Math.max(0, effectiveNow - baseStartedAt - play.pausedAccumulatedMs)
+        const elapsedSeconds = Math.max(0, Math.floor(elapsedMs / 1000))
+        const nextDuration = Math.max(0, elapsedSeconds)
+        setRundownSafe((prev) => ({
+          ...prev,
+          items: prev.items.map((x) =>
+            x.id === current.id && (x.kind === 'newsItem' || x.kind === 'sectionHeader') ? { ...x, durationSeconds: nextDuration } : x,
+          ),
+        }))
+      }
+    }
+
     setPlay((prev) => {
       if (includedRows.length === 0) return prev
       const next = Math.min(prev.currentIncludedIndex + 1, includedRows.length)
       if (next >= includedRows.length) {
         return { state: 'idle', currentIncludedIndex: 0, itemStartedAtMs: null, pausedAtMs: null, pausedAccumulatedMs: 0 }
       }
-      return { ...prev, state: 'running', currentIncludedIndex: next, itemStartedAtMs: Date.now(), pausedAtMs: null, pausedAccumulatedMs: 0 }
+      return { ...prev, state: 'running', currentIncludedIndex: next, itemStartedAtMs: now, pausedAtMs: null, pausedAccumulatedMs: 0 }
     })
   }
 
@@ -473,18 +641,26 @@ function App() {
   const currentPlayingIdForFollow =
     play.state !== 'idle' && includedRows[play.currentIncludedIndex] ? includedRows[play.currentIncludedIndex]!.item.id : null
 
+  // Scroll once when the playing item changes — never override manual scroll.
   useEffect(() => {
-    if (!autoFollow) return
+    if (play.state === 'idle') return
     if (!currentPlayingIdForFollow) return
-    const container = tableScrollRef.current
-    if (!container) return
-    const el = document.getElementById(`row-${currentPlayingIdForFollow}`)
-    if (!el) return
-    const elTop = (el as HTMLElement).offsetTop
-    const elH = (el as HTMLElement).offsetHeight
-    const targetTop = Math.max(0, elTop - container.clientHeight / 2 + elH / 2)
-    container.scrollTo({ top: targetTop, behavior: 'smooth' })
-  }, [autoFollow, currentPlayingIdForFollow])
+
+    const raf = window.requestAnimationFrame(() => {
+      const el = document.getElementById(`row-${currentPlayingIdForFollow}`) as HTMLElement | null
+      if (!el) return
+      const container = (el.closest('.tableScroll') as HTMLDivElement | null) ?? tableScrollRef.current
+      if (!container) return
+      if (container.scrollHeight <= container.clientHeight + 2) return
+
+      // Position current item at 3/4 down from the top of the visible area.
+      const targetTop = el.offsetTop - container.clientHeight * (3 / 4) + el.offsetHeight / 2
+      const clamped = Math.max(0, Math.min(targetTop, container.scrollHeight - container.clientHeight))
+      container.scrollTop = clamped
+    })
+
+    return () => window.cancelAnimationFrame(raf)
+  }, [currentPlayingIdForFollow])
 
   if (!rundown || !computed || !programId) {
     return (
@@ -499,7 +675,7 @@ function App() {
           <div className="card">
             <div className="cardTitle">프로그램 선택</div>
             <div className="programGrid">
-              {PROGRAMS.map((p) => (
+              {programs.map((p) => (
                 <button key={p.id} className="programBtn" onClick={() => onPickProgram(p)}>
                   <div className="programName">{p.name}</div>
                   <div className="programMeta">템플릿 자동 로딩(있으면) · 없으면 빈 큐시트</div>
@@ -507,10 +683,38 @@ function App() {
               ))}
             </div>
             <div className="row" style={{ marginTop: 12, gap: 10, flexWrap: 'wrap' }}>
+              <input
+                className="input"
+                placeholder="새 프로그램 이름"
+                value={newProgramNameDraft}
+                onChange={(e) => setNewProgramNameDraft(e.target.value)}
+                style={{ maxWidth: 220 }}
+              />
+              <button
+                className="btn"
+                onClick={() => {
+                  const name = newProgramNameDraft.trim()
+                  if (!name) {
+                    alert('프로그램 이름을 입력해 주세요.')
+                    return
+                  }
+                  const existing = new Set(programs.map((p) => p.id))
+                  const id = autoProgramId(name, existing)
+                  const next = [...programs, { id, name, builtIn: false }]
+                  setPrograms(next)
+                  persistCustomPrograms(next)
+                  setNewProgramNameDraft('')
+                }}
+              >
+                프로그램 추가
+              </button>
+              <div className="hint">추가된 프로그램은 로컬에 저장됩니다.</div>
+            </div>
+            <div className="row" style={{ marginTop: 12, gap: 10, flexWrap: 'wrap' }}>
               <button
                 className="btn subtle"
                 onClick={() => {
-                  const first = PROGRAMS[0]
+                  const first = programs[0]
                   if (!first) return
                   loadLastRundownSession(first.id)
                 }}
@@ -574,7 +778,7 @@ function App() {
           </div>
           <div className="metric">
             <div className="label">진행시간</div>
-            <div className="value mono">{formatSeconds(computed.includedTotalSeconds)}</div>
+            <div className="value mono">{formatSeconds(elapsedRunSeconds)}</div>
           </div>
           <div className="metric">
             <div className="label">편성대비</div>
@@ -583,14 +787,9 @@ function App() {
         </div>
 
         <div className="topActions">
-          <button
-            className="btn subtle"
-            onClick={() => setAutoFollow((v) => !v)}
-            title={autoFollow ? '자동 스크롤 끄기(수동 보기)' : '자동 스크롤 켜기(진행 따라가기)'}
-            disabled={play.state === 'idle'}
-          >
-            {autoFollow ? '따라가기:ON' : '따라가기:OFF'}
-          </button>
+          <span className="tag mono" title="뉴스끝 이전, includeInRun=true인 전체 아이템(뉴스+섹션) 합계">
+            합계 {formatSeconds(computed.includedTotalSeconds)}
+          </span>
           <button
             className="btn subtle"
             onClick={() => {
@@ -606,19 +805,11 @@ function App() {
           <button className="btn" onClick={saveCurrentAsTemplate} title="현재 큐시트를 템플릿으로 저장">
             템플릿 저장
           </button>
-          <button className="btn" onClick={startNewsNow} title="현재 시간으로 뉴스 시작">
-            뉴스시작
-          </button>
-          <button className="btn subtle" onClick={togglePause} disabled={play.state === 'idle'}>
-            {play.state === 'paused' ? '재개' : '포즈'}
-          </button>
-          <button className="btn subtle" onClick={nextItemNow} disabled={play.state === 'idle'}>
-            다음 아이템
-          </button>
           <button
             className="btn"
             onClick={() => {
-              exportRundown()
+              if (confirm('템플릿을 내보낼까요? (취소를 누르면 큐시트를 내보냅니다)')) exportTemplate()
+              else exportRundown()
             }}
           >
             내보내기
@@ -632,17 +823,6 @@ function App() {
             }}
           >
             불러오기
-          </button>
-          <button
-            className="btn subtle"
-            onClick={() => {
-              const p = PROGRAMS.find((x) => x.id === programId)
-              if (!p) return
-              if (!confirm('템플릿으로 초기화할까요? (현재 작업은 로컬에 덮어씁니다)')) return
-              setFromTemplate(p)
-            }}
-          >
-            초기화
           </button>
         </div>
       </div>
@@ -674,7 +854,7 @@ function App() {
               const beforeEnd = endIdx >= 0 ? rows.slice(0, endIdx) : rows
               const endRow = endIdx >= 0 ? rows[endIdx] : null
               const afterEnd = endIdx >= 0 ? rows.slice(endIdx + 1) : []
-              const pinnedAfter = afterEnd.slice(0, 2)
+              const afterEndSlots = afterEnd.slice(0, 2)
 
               let displayNo = 0
               const renderRow = (row: (typeof rows)[number]) => {
@@ -687,7 +867,8 @@ function App() {
                 const emphasis = it.kind === 'newsItem' ? it.isEmphasis : false
                 const selected = selectedItemId != null && it.id === selectedItemId
 
-                const showNumber = it.kind === 'newsItem'
+                const showNumber =
+                  it.kind === 'newsItem' && (it.category === '완제' || it.category === '단신') && it.title.trim() !== ''
                 if (showNumber) displayNo += 1
 
                 return (
@@ -867,6 +1048,21 @@ function App() {
                           >
                             {it.includeInRun ? '✓' : '⏸'}
                           </button>
+                        ) : it.kind === 'sectionHeader' ? (
+                          <button
+                            className="iconBtn"
+                            title={it.includeInRun && !isAfterEnd ? '시간계산 제외' : '시간계산 포함'}
+                            onClick={() => {
+                              setRundownSafe((prev) => ({
+                                ...prev,
+                                items: prev.items.map((x) =>
+                                  x.id === it.id && x.kind === 'sectionHeader' ? { ...x, includeInRun: !x.includeInRun } : x,
+                                ),
+                              }))
+                            }}
+                          >
+                            {it.includeInRun ? '✓' : '⏸'}
+                          </button>
                         ) : null}
                         {!isMarkerEnd ? (
                           <button
@@ -893,20 +1089,31 @@ function App() {
                   <div
                     ref={tableScrollRef}
                     className="tableScroll"
+                    style={{ paddingBottom: pinnedFooterHeight ? pinnedFooterHeight + 16 : undefined }}
                     onScroll={() => {
-                      // user manual scroll disables follow until toggled back on
-                      if (autoFollow && play.state !== 'idle') setAutoFollow(false)
+                      // follow toggle removed; keep behavior unchanged (no-op)
                     }}
                   >
                     {beforeEnd.map(renderRow)}
-                  </div>
-
-                  <div className="tablePinned">
                     {endRow ? renderRow(endRow) : null}
-                    {pinnedAfter.map(renderRow)}
+                    {Array.from({ length: 2 }).map((_, i) => {
+                      const row = afterEndSlots[i] ?? null
+                      if (row) return renderRow(row)
+                      return (
+                        <div key={`pinned-spacer-${i}`} className="tr pinnedSpacerRow afterEnd">
+                          <div className="mono"></div>
+                          <div></div>
+                          <div></div>
+                          <div className="titleCell"></div>
+                          <div className="right mono"></div>
+                          <div></div>
+                          <div className="right"></div>
+                        </div>
+                      )
+                    })}
                     {afterEnd.length > 2 ? <div className="pinnedMore muted">… 뉴스끝 아래 {afterEnd.length - 2}개 더 있음</div> : null}
 
-                    <div className="footerBar pinnedFooter">
+                    <div ref={pinnedFooterRef} className="footerBar pinnedFooter pinnedFooterFixed">
                       <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
                         <button
                           className="btn subtle"
@@ -987,7 +1194,7 @@ function App() {
                               kind: 'sectionHeader',
                               title: '섹션',
                               durationSeconds: 0,
-                              includeInRun: false,
+                              includeInRun: true,
                             }
                             setRundownSafe((prev) => ({ ...prev, items: insertBeforeMarkerEnd(prev.items, header) }))
                           }}
@@ -997,6 +1204,19 @@ function App() {
                       </div>
 
                       <div className="row" style={{ gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+                        <button
+                          className="btn playToggle"
+                          onClick={() => {
+                            if (play.state === 'idle') startNewsNow()
+                            else togglePause()
+                          }}
+                          title={play.state === 'idle' ? '현재 시간으로 뉴스 시작' : play.state === 'paused' ? '재개' : '포즈'}
+                        >
+                          {play.state === 'idle' ? '뉴스시작' : play.state === 'paused' ? '재개' : '포즈'}
+                        </button>
+                        <button className="btn bigNextBtn" onClick={nextItemNow} disabled={play.state === 'idle'} title="다음 아이템으로">
+                          다음 아이템
+                        </button>
                         <label className="field">
                           <span className="fieldLabel">뉴스 시작</span>
                           <input
@@ -1060,7 +1280,7 @@ function App() {
           const f = e.currentTarget.files?.[0]
           if (!f) return
           try {
-            await onImportRundownFile(f)
+            await onImportJsonFile(f)
           } catch (err) {
             alert(err instanceof Error ? err.message : '불러오기에 실패했습니다.')
           }
@@ -1085,11 +1305,11 @@ function DurationEditor(props: {
   return (
     <div className="dur">
       <div className="durBtns">
-        <button className="miniBtn" onClick={() => props.onDelta(-10)}>
-          -10
-        </button>
         <button className="miniBtn" onClick={() => props.onDelta(-5)}>
           -5
+        </button>
+        <button className="miniBtn" onClick={() => props.onDelta(1)} title="+1초">
+          +1
         </button>
         <button className="miniBtn" onClick={() => props.onDelta(5)}>
           +5

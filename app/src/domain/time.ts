@@ -69,12 +69,17 @@ export function computeRundown(rundown: Rundown): {
   let afterEnd = false
   let runningIncludedSeconds = 0
   let includedTotalSeconds = 0
+  let includedNewsItemSeconds = 0
+
+  const isRunnable = (it: RundownItem) => it.kind === 'newsItem' || it.kind === 'sectionHeader'
 
   // First pass compute included total seconds
   for (const it of rundown.items) {
     if (it.kind === 'marker' && it.title === '뉴스끝') afterEnd = true
-    const included = !afterEnd && it.kind === 'newsItem' && it.includeInRun
+    const included = !afterEnd && isRunnable(it) && it.includeInRun
     if (included) includedTotalSeconds += it.durationSeconds
+    const newsIncluded = !afterEnd && it.kind === 'newsItem' && it.includeInRun
+    if (newsIncluded) includedNewsItemSeconds += it.durationSeconds
   }
 
   // Second pass compute per-row start times for included rows
@@ -83,16 +88,17 @@ export function computeRundown(rundown: Rundown): {
     const isMarkerEnd = it.kind === 'marker' && it.title === '뉴스끝'
     if (isMarkerEnd) afterEnd = true
 
-    const isIncluded = !afterEnd && it.kind === 'newsItem' && it.includeInRun
+    const isIncluded = !afterEnd && isRunnable(it) && it.includeInRun
     const startTime = isIncluded ? addSecondsToClock(rundown.timing.newsStartTime, runningIncludedSeconds) : null
     rows.push({ item: it, isAfterEnd: afterEnd && !isMarkerEnd, isIncluded, startTime })
-    if (isIncluded && it.kind === 'newsItem') runningIncludedSeconds += it.durationSeconds
+    if (isIncluded && isRunnable(it)) runningIncludedSeconds += it.durationSeconds
   }
 
   return {
     rows,
     includedTotalSeconds,
-    deltaSeconds: rundown.timing.scheduledSeconds - includedTotalSeconds,
+    // 편성대비 = 전체 아이템 합(뉴스아이템 + 섹션헤더, includeInRun=true, 뉴스끝 이전) - 편성시간
+    deltaSeconds: includedTotalSeconds - rundown.timing.scheduledSeconds,
   }
 }
 

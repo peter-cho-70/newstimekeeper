@@ -13,7 +13,7 @@ export type TemplateItem =
       flags: string[]
     }
   | { id: string; kind: 'blank'; title: string; includeInRun: false }
-  | { id: string; kind: 'sectionHeader'; title: string; durationSeconds: number; includeInRun: false }
+  | { id: string; kind: 'sectionHeader'; title: string; durationSeconds: number; includeInRun: boolean }
   | { id: string; kind: 'marker'; title: string; includeInRun: false }
 
 export type Template = {
@@ -45,7 +45,7 @@ export type RundownItem =
       flags: string[]
     }
   | { id: string; kind: 'blank'; title: string; includeInRun: false }
-  | { id: string; kind: 'sectionHeader'; title: string; durationSeconds: number; includeInRun: false }
+  | { id: string; kind: 'sectionHeader'; title: string; durationSeconds: number; includeInRun: boolean }
   | { id: string; kind: 'marker'; title: string; includeInRun: false }
 
 export type Rundown = {

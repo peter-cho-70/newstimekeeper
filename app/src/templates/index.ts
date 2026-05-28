@@ -9,7 +9,7 @@ export const NEWS_EXTRA_TEMPLATE: Template = {
   updatedAt: new Date().toISOString(),
   defaults: { scheduledSeconds: 3060, newsStartTime: '20:00:00' },
   items: [
-    { id: 'sec_open', kind: 'sectionHeader', title: '오프닝', durationSeconds: 0, includeInRun: false },
+    { id: 'sec_open', kind: 'sectionHeader', title: '오프닝', durationSeconds: 0, includeInRun: true },
     {
       id: 'title',
       kind: 'newsItem',
@@ -50,7 +50,7 @@ export const NEWS_ECONOMY_TEMPLATE: Template = {
   updatedAt: new Date().toISOString(),
   defaults: { scheduledSeconds: 3060, newsStartTime: '20:00:00' },
   items: [
-    { id: 'sec_open', kind: 'sectionHeader', title: '오프닝', durationSeconds: 0, includeInRun: false },
+    { id: 'sec_open', kind: 'sectionHeader', title: '오프닝', durationSeconds: 0, includeInRun: true },
     {
       id: 'title',
       kind: 'newsItem',
