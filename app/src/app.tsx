@@ -180,6 +180,7 @@ function App() {
   const [programId, setProgramId] = useState<ProgramId | null>(null)
   const [rundown, setRundown] = useState<Rundown | null>(null)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
+  const templatesFileInputRef = useRef<HTMLInputElement | null>(null)
   const [focusItemId, setFocusItemId] = useState<string | null>(null)
   const [selectedItemId, setSelectedItemId] = useState<string | null>(null)
   const pinnedFooterRef = useRef<HTMLDivElement | null>(null)
@@ -515,27 +516,6 @@ function App() {
     alert(`템플릿을 모두 로컬에 저장했습니다. (추가 저장 ${saved}개)`)
   }
 
-  async function importAllTemplatesFromPublic() {
-    const ids = await getAllKnownTemplateIds()
-    let imported = 0
-    const addedPrograms: ProgramDef[] = []
-    for (const id of ids) {
-      const t = await loadTemplateFromPublic(id)
-      if (!t) continue
-      localStorage.setItem(storageKeyForTemplate(id), JSON.stringify(t))
-      imported += 1
-      if (!programs.some((p) => p.id === id)) {
-        addedPrograms.push({ id, name: t.programName || id, builtIn: false })
-      }
-    }
-    if (addedPrograms.length > 0) {
-      const next = [...programs, ...addedPrograms]
-      setPrograms(next)
-      persistCustomPrograms(next)
-    }
-    alert(`템플릿을 모두 불러왔습니다. (${imported}개)`)
-  }
-
   async function exportAllTemplates() {
     const ids = await getAllKnownTemplateIds()
     const templates: Template[] = []
@@ -831,7 +811,15 @@ function App() {
               <button className="btn subtle" onClick={() => void exportAllTemplates()} title="알려진 모든 템플릿을 한 파일로 내보내기">
                 템플릿 전체 내보내기
               </button>
-              <button className="btn subtle" onClick={() => void importAllTemplatesFromPublic()} title="저장된 기본 템플릿을 모두 불러오기(로컬에 덮어씀)">
+              <button
+                className="btn subtle"
+                onClick={() => {
+                  if (!templatesFileInputRef.current) return
+                  templatesFileInputRef.current.value = ''
+                  templatesFileInputRef.current.click()
+                }}
+                title="내보낸 템플릿 번들(JSON)을 로컬 파일에서 불러오기"
+              >
                 템플릿 전체 불러오기
               </button>
               <input
@@ -887,6 +875,21 @@ function App() {
             </div>
             <input
               ref={fileInputRef}
+              type="file"
+              accept="application/json"
+              style={{ display: 'none' }}
+              onChange={async (e) => {
+                const f = e.currentTarget.files?.[0]
+                if (!f) return
+                try {
+                  await onImportJsonFile(f)
+                } catch (err) {
+                  alert(err instanceof Error ? err.message : '불러오기에 실패했습니다.')
+                }
+              }}
+            />
+            <input
+              ref={templatesFileInputRef}
               type="file"
               accept="application/json"
               style={{ display: 'none' }}
