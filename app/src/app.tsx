@@ -51,6 +51,12 @@ function storageKeyForTemplate(programId: ProgramId) {
   return `${TEMPLATE_KEY_PREFIX}${programId}`
 }
 
+type TemplatesBundle = {
+  schemaVersion: string
+  type: 'templatesBundle'
+  templates: Template[]
+}
+
 function nowClockHHMMSS() {
   const d = new Date()
   const hh = String(d.getHours()).padStart(2, '0')
@@ -472,6 +478,39 @@ function App() {
     }
   }
 
+  async function loadPublicTemplatesIndex(): Promise<string[]> {
+    try {
+      const res = await fetch('/templates/index.json', { cache: 'no-store' })
+      if (!res.ok) return []
+      const parsed = (await res.json()) as any
+      const ids = Array.isArray(parsed?.programIds) ? parsed.programIds : []
+      return ids.filter((x: any) => typeof x === 'string')
+    } catch {
+      return []
+    }
+  }
+
+  async function ensureAllTemplatesSavedToLocal() {
+    const ids = await loadPublicTemplatesIndex()
+    for (const id of ids) {
+      const already = loadTemplateFromStorage(id)
+      if (already) continue
+      const t = await loadTemplateFromPublic(id)
+      if (t) localStorage.setItem(storageKeyForTemplate(id), JSON.stringify(t))
+    }
+    alert('기본 템플릿을 모두 로컬에 저장했습니다.')
+  }
+
+  function exportAllTemplates() {
+    const templates: Template[] = []
+    for (const p of programs) {
+      const t = loadTemplateFromStorage(p.id)
+      if (t) templates.push(t)
+    }
+    const bundle: TemplatesBundle = { schemaVersion: '1.0', type: 'templatesBundle', templates }
+    downloadJson(`templates_all_${new Date().toISOString().slice(0, 10)}.json`, bundle)
+  }
+
   async function onPickProgram(p: ProgramDef) {
     // B안: 프로그램 선택 화면 → 동일 메인 화면.
     // 요구사항: "템플릿 저장"을 해두면 열 때마다 템플릿이 자동으로 열린다.
@@ -567,6 +606,26 @@ function App() {
       } else {
         alert('템플릿을 저장했습니다. 다음에 프로그램을 열면 자동으로 이 템플릿이 열립니다.')
       }
+      return
+    }
+    if (parsed?.type === 'templatesBundle' && Array.isArray(parsed?.templates)) {
+      const templates = parsed.templates as Template[]
+      const addedPrograms: ProgramDef[] = []
+      for (const t0 of templates) {
+        if (!t0 || t0.type !== 'template') continue
+        const t = normalizeTemplate(t0)
+        const pId = String(t.programId)
+        localStorage.setItem(storageKeyForTemplate(pId), JSON.stringify(t))
+        if (!programs.some((p) => p.id === pId)) {
+          addedPrograms.push({ id: pId, name: t.programName || pId, builtIn: false })
+        }
+      }
+      if (addedPrograms.length > 0) {
+        const next = [...programs, ...addedPrograms]
+        setPrograms(next)
+        persistCustomPrograms(next)
+      }
+      alert(`템플릿 ${templates.length}개를 로컬에 저장했습니다.`)
       return
     }
     throw new Error('지원하지 않는 파일 형식입니다. (rundown/template JSON만 가능)')
@@ -828,6 +887,12 @@ function App() {
           <span className="tag mono" title="뉴스끝 이전, includeInRun=true인 전체 아이템(뉴스+섹션) 합계">
             합계 {formatSeconds(computed.includedTotalSeconds)}
           </span>
+          <button className="btn subtle" onClick={() => void ensureAllTemplatesSavedToLocal()} title="배포 기본 템플릿을 모두 로컬에 저장">
+            템플릿 전체 저장
+          </button>
+          <button className="btn subtle" onClick={exportAllTemplates} title="현재 로컬에 저장된 모든 템플릿을 파일로 내보내기">
+            템플릿 전체 내보내기
+          </button>
           <button
             className="btn subtle"
             onClick={() => {
