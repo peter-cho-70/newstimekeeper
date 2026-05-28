@@ -1,0 +1,17 @@
+{
+  "schemaVersion": "1.0",
+  "type": "template",
+  "programId": "news_12",
+  "programName": "12시뉴스",
+  "createdAt": "2026-05-28T00:00:00Z",
+  "updatedAt": "2026-05-28T00:00:00Z",
+  "defaults": {
+    "scheduledSeconds": 3060,
+    "newsStartTime": "12:00:00"
+  },
+  "items": [
+    { "id": "sec_open", "kind": "sectionHeader", "title": "오프닝", "durationSeconds": 0, "includeInRun": true },
+    { "id": "end", "kind": "marker", "title": "뉴스끝", "includeInRun": false }
+  ]
+}
+

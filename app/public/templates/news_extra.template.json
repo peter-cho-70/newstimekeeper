@@ -1,0 +1,44 @@
+{
+  "schemaVersion": "1.0",
+  "type": "template",
+  "programId": "news_extra",
+  "programName": "뉴스외전",
+  "createdAt": "2026-05-28T00:00:00Z",
+  "updatedAt": "2026-05-28T00:00:00Z",
+  "defaults": {
+    "scheduledSeconds": 3060,
+    "newsStartTime": "20:00:00"
+  },
+  "items": [
+    { "id": "sec_open", "kind": "sectionHeader", "title": "오프닝", "durationSeconds": 0, "includeInRun": true },
+    {
+      "id": "title",
+      "kind": "newsItem",
+      "category": "완제",
+      "reporter": "",
+      "title": "타이틀",
+      "durationSeconds": 20,
+      "notes": "",
+      "isDefaultItem": true,
+      "isEmphasis": false,
+      "includeInRun": true,
+      "flags": []
+    },
+    {
+      "id": "greet",
+      "kind": "newsItem",
+      "category": "완제",
+      "reporter": "",
+      "title": "앵커 인사",
+      "durationSeconds": 20,
+      "notes": "",
+      "isDefaultItem": true,
+      "isEmphasis": false,
+      "includeInRun": true,
+      "flags": []
+    },
+    { "id": "blank1", "kind": "blank", "title": "", "includeInRun": false },
+    { "id": "end", "kind": "marker", "title": "뉴스끝", "includeInRun": false }
+  ]
+}
+

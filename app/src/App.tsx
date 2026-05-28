@@ -459,12 +459,50 @@ function App() {
     }
   }
 
-  function onPickProgram(p: ProgramDef) {
+  async function loadTemplateFromPublic(pId: ProgramId): Promise<Template | null> {
+    try {
+      const res = await fetch(`/templates/${encodeURIComponent(pId)}.template.json`, { cache: 'no-store' })
+      if (!res.ok) return null
+      const parsed = (await res.json()) as Template
+      if (parsed?.type !== 'template') return null
+      if (parsed?.programId !== pId) return null
+      return normalizeTemplate(parsed)
+    } catch {
+      return null
+    }
+  }
+
+  async function onPickProgram(p: ProgramDef) {
     // B안: 프로그램 선택 화면 → 동일 메인 화면.
     // 요구사항: "템플릿 저장"을 해두면 열 때마다 템플릿이 자동으로 열린다.
     const storedTemplate = loadTemplateFromStorage(p.id)
     if (storedTemplate) {
       const rd = cloneTemplateToRundown(normalizeTemplate(storedTemplate))
+      setProgramId(p.id)
+      setRundown(rd)
+      localStorage.setItem(storageKeyForRundown(p.id), JSON.stringify(rd))
+      setPlay({ state: 'idle', currentIncludedIndex: 0, itemStartedAtMs: null, pausedAtMs: null, pausedAccumulatedMs: 0 })
+      setSelectedItemId(null)
+      return
+    }
+
+    // If no saved template, try loading default templates committed to GitHub (served via public/ on Vercel).
+    const publicTemplate = await loadTemplateFromPublic(p.id)
+    if (publicTemplate) {
+      localStorage.setItem(storageKeyForTemplate(p.id), JSON.stringify(publicTemplate))
+      const rd = cloneTemplateToRundown(publicTemplate)
+      setProgramId(p.id)
+      setRundown(rd)
+      localStorage.setItem(storageKeyForRundown(p.id), JSON.stringify(rd))
+      setPlay({ state: 'idle', currentIncludedIndex: 0, itemStartedAtMs: null, pausedAtMs: null, pausedAccumulatedMs: 0 })
+      setSelectedItemId(null)
+      return
+    }
+
+    // Fallback to built-in TS template if provided.
+    if (p.template) {
+      localStorage.setItem(storageKeyForTemplate(p.id), JSON.stringify(p.template))
+      const rd = cloneTemplateToRundown(p.template)
       setProgramId(p.id)
       setRundown(rd)
       localStorage.setItem(storageKeyForRundown(p.id), JSON.stringify(rd))
@@ -676,7 +714,7 @@ function App() {
             <div className="cardTitle">프로그램 선택</div>
             <div className="programGrid">
               {programs.map((p) => (
-                <button key={p.id} className="programBtn" onClick={() => onPickProgram(p)}>
+                <button key={p.id} className="programBtn" onClick={() => void onPickProgram(p)}>
                   <div className="programName">{p.name}</div>
                   <div className="programMeta">템플릿 자동 로딩(있으면) · 없으면 빈 큐시트</div>
                 </button>
