@@ -1,0 +1,1125 @@
+import { useEffect, useMemo, useRef, useState } from 'react'
+import './app.css'
+import type { Rundown, RundownItem, Template } from './domain/types'
+import { computeRundown, formatDelta, formatSeconds, parseTimeToSeconds } from './domain/time'
+import { NEWS_ECONOMY_TEMPLATE, NEWS_EXTRA_TEMPLATE } from './templates'
+import { downloadJson, readJsonFile } from './domain/file'
+import { uid } from './domain/uid'
+
+type ProgramId = 'news_extra' | 'news_economy'
+
+const PROGRAMS: Array<{ id: ProgramId; name: string; template: Template }> = [
+  { id: 'news_extra', name: '뉴스외전', template: NEWS_EXTRA_TEMPLATE },
+  { id: 'news_economy', name: '뉴스와 경제', template: NEWS_ECONOMY_TEMPLATE },
+]
+
+const DEFAULT_DURATION_BY_CATEGORY: Record<string, number> = {
+  완제: 90,
+  단신: 30,
+  '': 0,
+  공란: 0, // backward compat (older saved data)
+}
+
+function defaultDurationForCategory(category: string): number {
+  return DEFAULT_DURATION_BY_CATEGORY[category] ?? 90
+}
+
+const STORAGE_KEY_PREFIX = 'newstimekeeper:rundown:v1:'
+const TEMPLATE_KEY_PREFIX = 'newstimekeeper:template:v1:'
+
+type PlayState = 'idle' | 'running' | 'paused'
+type PlaySession = {
+  state: PlayState
+  currentIncludedIndex: number
+  itemStartedAtMs: number | null
+  pausedAtMs: number | null
+  pausedAccumulatedMs: number
+}
+
+function storageKeyForRundown(programId: ProgramId) {
+  return `${STORAGE_KEY_PREFIX}${programId}`
+}
+function storageKeyForTemplate(programId: ProgramId) {
+  return `${TEMPLATE_KEY_PREFIX}${programId}`
+}
+
+function nowClockHHMMSS() {
+  const d = new Date()
+  const hh = String(d.getHours()).padStart(2, '0')
+  const mm = String(d.getMinutes()).padStart(2, '0')
+  const ss = String(d.getSeconds()).padStart(2, '0')
+  return `${hh}:${mm}:${ss}`
+}
+
+function createEmptyRundown(p: (typeof PROGRAMS)[number]): Rundown {
+  const marker: RundownItem = { id: uid('m_'), kind: 'marker', title: '뉴스끝', includeInRun: false }
+  return {
+    schemaVersion: '1.0',
+    type: 'rundown',
+    programId: p.id,
+    programName: p.name,
+    broadcastDate: new Date().toISOString().slice(0, 10),
+    episodeLabel: '',
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    timing: {
+      newsStartTime: '20:00:00',
+      scheduledSeconds: 3060,
+      toleranceSeconds: 15,
+    },
+    items: [marker],
+  }
+}
+
+function normalizeRundown(r: Rundown): Rundown {
+  return {
+    ...r,
+    items: r.items.map((it) => {
+      if (it.kind === 'sectionHeader') {
+        const dur = typeof (it as any).durationSeconds === 'number' ? (it as any).durationSeconds : 0
+        return { ...it, durationSeconds: dur }
+      }
+      return it
+    }),
+  }
+}
+
+function normalizeTemplate(t: Template): Template {
+  return {
+    ...t,
+    items: t.items.map((it) => {
+      if (it.kind === 'sectionHeader') {
+        const dur = typeof (it as any).durationSeconds === 'number' ? (it as any).durationSeconds : 0
+        return { ...it, durationSeconds: dur }
+      }
+      return it
+    }),
+  }
+}
+
+function rundownToTemplate(rundown: Rundown): Template {
+  return {
+    schemaVersion: '1.0',
+    type: 'template',
+    programId: rundown.programId,
+    programName: rundown.programName,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    defaults: {
+      scheduledSeconds: rundown.timing.scheduledSeconds,
+      newsStartTime: rundown.timing.newsStartTime,
+    },
+    items: rundown.items.map((it) => {
+      if (it.kind === 'newsItem') return { ...it, id: uid('t_') }
+      return { ...it, id: uid('t_') }
+    }),
+  }
+}
+
+function cloneTemplateToRundown(template: Template): Rundown {
+  const items: RundownItem[] = template.items.map((it) => {
+    if (it.kind === 'newsItem') {
+      return { ...it, id: uid('i_') }
+    }
+    return { ...it, id: uid('r_') }
+  })
+  return {
+    schemaVersion: '1.0',
+    type: 'rundown',
+    programId: template.programId,
+    programName: template.programName,
+    broadcastDate: new Date().toISOString().slice(0, 10),
+    episodeLabel: '',
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    timing: {
+      newsStartTime: template.defaults.newsStartTime,
+      scheduledSeconds: template.defaults.scheduledSeconds,
+      toleranceSeconds: 15,
+    },
+    items,
+  }
+}
+
+function App() {
+  const [programId, setProgramId] = useState<ProgramId | null>(null)
+  const [rundown, setRundown] = useState<Rundown | null>(null)
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
+  const [focusItemId, setFocusItemId] = useState<string | null>(null)
+  const [selectedItemId, setSelectedItemId] = useState<string | null>(null)
+  const [play, setPlay] = useState<PlaySession>({
+    state: 'idle',
+    currentIncludedIndex: 0,
+    itemStartedAtMs: null,
+    pausedAtMs: null,
+    pausedAccumulatedMs: 0,
+  })
+
+  const [newsStartDraft, setNewsStartDraft] = useState<string>('20:00:00')
+  const [scheduledDraft, setScheduledDraft] = useState<string>('51:00')
+  const [autoFollow, setAutoFollow] = useState<boolean>(true)
+  const tableScrollRef = useRef<HTMLDivElement | null>(null)
+
+  const selectedIndex = useMemo(() => {
+    if (!rundown || !selectedItemId) return null
+    const idx = rundown.items.findIndex((x) => x.id === selectedItemId)
+    return idx >= 0 ? idx : null
+  }, [rundown, selectedItemId])
+
+  useEffect(() => {
+    if (!focusItemId) return
+    const id = focusItemId
+    const raf = window.requestAnimationFrame(() => {
+      const el = document.getElementById(`title-${id}`) as HTMLInputElement | null
+      if (el) {
+        el.focus()
+        el.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+      }
+      setFocusItemId(null)
+    })
+    return () => window.cancelAnimationFrame(raf)
+  }, [focusItemId])
+
+  useEffect(() => {
+    if (!rundown) return
+    setNewsStartDraft(rundown.timing.newsStartTime)
+    setScheduledDraft(formatSeconds(rundown.timing.scheduledSeconds))
+  }, [rundown?.timing.newsStartTime, rundown?.timing.scheduledSeconds])
+
+  function moveSelected(delta: -1 | 1) {
+    if (!rundown || selectedIndex == null) return
+    const idx = selectedIndex
+    const target = idx + delta
+    if (target < 0 || target >= rundown.items.length) return
+    const cur = rundown.items[idx]
+    if (!cur) return
+    if (cur.kind === 'marker' && cur.title === '뉴스끝') return
+    setRundownSafe((prev) => {
+      const items = [...prev.items]
+      ;[items[target], items[idx]] = [items[idx]!, items[target]!]
+      return { ...prev, items }
+    })
+    setFocusItemId(cur.id)
+  }
+
+  function takeOutToAfterEnd() {
+    if (!rundown || selectedIndex == null) return
+    const idx = selectedIndex
+    const cur = rundown.items[idx]
+    if (!cur) return
+    if (cur.kind === 'marker' && cur.title === '뉴스끝') return
+    setRundownSafe((prev) => {
+      const endIdx = prev.items.findIndex((x) => x.kind === 'marker' && x.title === '뉴스끝')
+      if (endIdx < 0) return prev
+      const items = [...prev.items]
+      const [picked] = items.splice(idx, 1)
+      if (!picked) return prev
+      const insertAt = endIdx < idx ? endIdx + 1 : endIdx + 0
+      items.splice(insertAt + 1, 0, picked)
+      // ensure excluded from calc even if later moved above accidentally
+      if (picked.kind === 'newsItem') {
+        const p = picked
+        return { ...prev, items: items.map((x) => (x.id === p.id && x.kind === 'newsItem' ? { ...x, includeInRun: false } : x)) }
+      }
+      return { ...prev, items }
+    })
+    setFocusItemId(cur.kind === 'newsItem' ? cur.id : null)
+  }
+
+  function putBackBeforeEnd() {
+    if (!rundown || selectedIndex == null) return
+    const idx = selectedIndex
+    const cur = rundown.items[idx]
+    if (!cur) return
+    if (cur.kind === 'marker' && cur.title === '뉴스끝') return
+    const isAfterEnd = selectedRow?.isAfterEnd === true
+    if (!isAfterEnd) return
+    setRundownSafe((prev) => {
+      const endIdx = prev.items.findIndex((x) => x.kind === 'marker' && x.title === '뉴스끝')
+      if (endIdx < 0) return prev
+      const items = [...prev.items]
+      const [picked] = items.splice(idx, 1)
+      if (!picked) return prev
+      const insertAt = endIdx < idx ? endIdx : endIdx
+      items.splice(insertAt, 0, picked)
+      if (picked.kind === 'newsItem') {
+        const p = picked
+        return { ...prev, items: items.map((x) => (x.id === p.id && x.kind === 'newsItem' ? { ...x, includeInRun: true } : x)) }
+      }
+      return { ...prev, items }
+    })
+    setFocusItemId(cur.kind === 'newsItem' ? cur.id : null)
+  }
+
+  const computed = useMemo(() => {
+    if (!rundown) return null
+    return computeRundown(rundown)
+  }, [rundown])
+
+  const includedRows = useMemo(() => {
+    if (!computed) return []
+    return computed.rows.filter((r) => r.isIncluded && r.item.kind === 'newsItem') as Array<
+      (typeof computed.rows)[number] & { item: Extract<RundownItem, { kind: 'newsItem' }> }
+    >
+  }, [computed])
+
+  const selectedRow = useMemo(() => {
+    if (!computed || !selectedItemId) return null
+    return computed.rows.find((r) => r.item.id === selectedItemId) ?? null
+  }, [computed, selectedItemId])
+
+  // Auto-advance engine
+  useEffect(() => {
+    if (play.state !== 'running') return
+    const t = window.setInterval(() => {
+      setPlay((prev) => {
+        if (prev.state !== 'running') return prev
+        const now = Date.now()
+
+        // If we have nothing to play, stay idle
+        if (includedRows.length === 0) {
+          return { ...prev, state: 'idle', currentIncludedIndex: 0, itemStartedAtMs: null, pausedAtMs: null, pausedAccumulatedMs: 0 }
+        }
+
+        let idx = Math.min(prev.currentIncludedIndex, includedRows.length - 1)
+        let itemStartedAtMs = prev.itemStartedAtMs ?? now
+
+        // Skip zero-duration items immediately
+        let guard = 0
+        while (guard < includedRows.length) {
+          const dur = includedRows[idx]?.item.durationSeconds ?? 0
+          if (dur > 0) break
+          idx += 1
+          itemStartedAtMs = now
+          if (idx >= includedRows.length) {
+            return { ...prev, state: 'idle', currentIncludedIndex: 0, itemStartedAtMs: null, pausedAtMs: null, pausedAccumulatedMs: 0 }
+          }
+          guard += 1
+        }
+
+        const dur = includedRows[idx]?.item.durationSeconds ?? 0
+        const elapsedMs = Math.max(0, now - itemStartedAtMs - prev.pausedAccumulatedMs)
+        if (dur > 0 && elapsedMs >= dur * 1000) {
+          const nextIdx = idx + 1
+          if (nextIdx >= includedRows.length) {
+            return { ...prev, state: 'idle', currentIncludedIndex: 0, itemStartedAtMs: null, pausedAtMs: null, pausedAccumulatedMs: 0 }
+          }
+          return { ...prev, currentIncludedIndex: nextIdx, itemStartedAtMs: now, pausedAccumulatedMs: 0, pausedAtMs: null }
+        }
+
+        if (idx !== prev.currentIncludedIndex || itemStartedAtMs !== prev.itemStartedAtMs) {
+          return { ...prev, currentIncludedIndex: idx, itemStartedAtMs }
+        }
+
+        return prev
+      })
+    }, 200)
+    return () => window.clearInterval(t)
+  }, [play.state, includedRows])
+
+  function setFromTemplate(p: (typeof PROGRAMS)[number]) {
+    const rd = cloneTemplateToRundown(p.template)
+    setProgramId(p.id)
+    setRundown(rd)
+    localStorage.setItem(storageKeyForRundown(p.id), JSON.stringify(rd))
+    setPlay({ state: 'idle', currentIncludedIndex: 0, itemStartedAtMs: null, pausedAtMs: null, pausedAccumulatedMs: 0 })
+    setSelectedItemId(null)
+  }
+
+  function setRundownSafe(updater: (prev: Rundown) => Rundown) {
+    setRundown((prev) => {
+      if (!prev) return prev
+      const next = { ...updater(prev), updatedAt: new Date().toISOString() }
+      localStorage.setItem(storageKeyForRundown(next.programId as ProgramId), JSON.stringify(next))
+      return next
+    })
+  }
+
+  function tryLoadFromStorage(pId: ProgramId) {
+    const raw = localStorage.getItem(storageKeyForRundown(pId))
+    if (!raw) return false
+    try {
+      const parsed = JSON.parse(raw) as Rundown
+      if (parsed?.type !== 'rundown') return false
+      if (parsed?.programId !== pId) return false
+      setProgramId(pId)
+      setRundown(normalizeRundown(parsed))
+      setPlay({ state: 'idle', currentIncludedIndex: 0, itemStartedAtMs: null, pausedAtMs: null, pausedAccumulatedMs: 0 })
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  function loadTemplateFromStorage(pId: ProgramId): Template | null {
+    const raw = localStorage.getItem(storageKeyForTemplate(pId))
+    if (!raw) return null
+    try {
+      const parsed = JSON.parse(raw) as Template
+      if (parsed?.type !== 'template') return null
+      if (parsed?.programId !== pId) return null
+      return normalizeTemplate(parsed)
+    } catch {
+      return null
+    }
+  }
+
+  function onPickProgram(p: (typeof PROGRAMS)[number]) {
+    // B안: 프로그램 선택 화면 → 동일 메인 화면.
+    // 요구사항: "템플릿 저장"을 해두면 열 때마다 템플릿이 자동으로 열린다.
+    const storedTemplate = loadTemplateFromStorage(p.id)
+    if (storedTemplate) {
+      const rd = cloneTemplateToRundown(normalizeTemplate(storedTemplate))
+      setProgramId(p.id)
+      setRundown(rd)
+      localStorage.setItem(storageKeyForRundown(p.id), JSON.stringify(rd))
+      setPlay({ state: 'idle', currentIncludedIndex: 0, itemStartedAtMs: null, pausedAtMs: null, pausedAccumulatedMs: 0 })
+      setSelectedItemId(null)
+      return
+    }
+
+    // 템플릿이 없으면 "빈 큐시트"로 시작
+    const empty = createEmptyRundown(p)
+    setProgramId(p.id)
+    setRundown(empty)
+    localStorage.setItem(storageKeyForRundown(p.id), JSON.stringify(empty))
+    setPlay({ state: 'idle', currentIncludedIndex: 0, itemStartedAtMs: null, pausedAtMs: null, pausedAccumulatedMs: 0 })
+    setSelectedItemId(null)
+  }
+
+  async function onImportRundownFile(file: File) {
+    const parsed = await readJsonFile<Rundown>(file)
+    if (parsed.type !== 'rundown') {
+      throw new Error('이 파일은 큐시트(rundown) 형식이 아닙니다.')
+    }
+    setProgramId(parsed.programId as ProgramId)
+    const normalized = normalizeRundown(parsed)
+    setRundown(normalized)
+    localStorage.setItem(storageKeyForRundown(parsed.programId as ProgramId), JSON.stringify(normalized))
+    setPlay({ state: 'idle', currentIncludedIndex: 0, itemStartedAtMs: null, pausedAtMs: null, pausedAccumulatedMs: 0 })
+    setSelectedItemId(null)
+  }
+
+  function exportRundown() {
+    if (!rundown) return
+    const filename = `rundown_${rundown.programId}_${rundown.broadcastDate || 'date'}_${uid('x_')}.json`
+    downloadJson(filename, rundown)
+  }
+
+  function saveCurrentAsTemplate() {
+    if (!rundown || !programId) return
+    const t = rundownToTemplate(rundown)
+    localStorage.setItem(storageKeyForTemplate(programId), JSON.stringify(t))
+    alert('이 큐시트를 템플릿으로 저장했습니다. 다음에 프로그램을 열면 자동으로 이 템플릿이 열립니다.')
+  }
+
+  function loadLastRundownSession(pId: ProgramId) {
+    if (tryLoadFromStorage(pId)) return
+    alert('저장된 마지막 작업이 없습니다.')
+  }
+
+  function startNewsNow() {
+    if (!rundown) return
+    const clock = nowClockHHMMSS()
+    setRundownSafe((prev) => ({
+      ...prev,
+      timing: { ...prev.timing, newsStartTime: clock },
+    }))
+    setNewsStartDraft(clock)
+    setAutoFollow(true)
+    setPlay({
+      state: 'running',
+      currentIncludedIndex: 0,
+      itemStartedAtMs: Date.now(),
+      pausedAtMs: null,
+      pausedAccumulatedMs: 0,
+    })
+    // start at top before auto-follow kicks in
+    window.requestAnimationFrame(() => {
+      tableScrollRef.current?.scrollTo({ top: 0 })
+    })
+  }
+
+  function togglePause() {
+    setPlay((prev) => {
+      if (prev.state === 'idle') return prev
+      if (prev.state === 'running') {
+        return { ...prev, state: 'paused', pausedAtMs: Date.now() }
+      }
+      // paused -> running
+      const now = Date.now()
+      const pausedFor = prev.pausedAtMs ? now - prev.pausedAtMs : 0
+      return {
+        ...prev,
+        state: 'running',
+        pausedAtMs: null,
+        pausedAccumulatedMs: prev.pausedAccumulatedMs + pausedFor,
+      }
+    })
+  }
+
+  function nextItemNow() {
+    setPlay((prev) => {
+      if (includedRows.length === 0) return prev
+      const next = Math.min(prev.currentIncludedIndex + 1, includedRows.length)
+      if (next >= includedRows.length) {
+        return { state: 'idle', currentIncludedIndex: 0, itemStartedAtMs: null, pausedAtMs: null, pausedAccumulatedMs: 0 }
+      }
+      return { ...prev, state: 'running', currentIncludedIndex: next, itemStartedAtMs: Date.now(), pausedAtMs: null, pausedAccumulatedMs: 0 }
+    })
+  }
+
+  // Auto-follow: must be declared before any conditional return
+  const currentPlayingIdForFollow =
+    play.state !== 'idle' && includedRows[play.currentIncludedIndex] ? includedRows[play.currentIncludedIndex]!.item.id : null
+
+  useEffect(() => {
+    if (!autoFollow) return
+    if (!currentPlayingIdForFollow) return
+    const container = tableScrollRef.current
+    if (!container) return
+    const el = document.getElementById(`row-${currentPlayingIdForFollow}`)
+    if (!el) return
+    const elTop = (el as HTMLElement).offsetTop
+    const elH = (el as HTMLElement).offsetHeight
+    const targetTop = Math.max(0, elTop - container.clientHeight / 2 + elH / 2)
+    container.scrollTo({ top: targetTop, behavior: 'smooth' })
+  }, [autoFollow, currentPlayingIdForFollow])
+
+  if (!rundown || !computed || !programId) {
+    return (
+      <div className="appShell">
+        <div className="topBar">
+          <div className="brand">
+            <div className="brandTitle">뉴스진행</div>
+            <div className="brandSub">Newstimekeeper (MVP)</div>
+          </div>
+        </div>
+        <div className="page">
+          <div className="card">
+            <div className="cardTitle">프로그램 선택</div>
+            <div className="programGrid">
+              {PROGRAMS.map((p) => (
+                <button key={p.id} className="programBtn" onClick={() => onPickProgram(p)}>
+                  <div className="programName">{p.name}</div>
+                  <div className="programMeta">템플릿 자동 로딩(있으면) · 없으면 빈 큐시트</div>
+                </button>
+              ))}
+            </div>
+            <div className="row" style={{ marginTop: 12, gap: 10, flexWrap: 'wrap' }}>
+              <button
+                className="btn subtle"
+                onClick={() => {
+                  const first = PROGRAMS[0]
+                  if (!first) return
+                  loadLastRundownSession(first.id)
+                }}
+                title="(임시) 마지막 작업 불러오기"
+              >
+                마지막 작업 불러오기(임시)
+              </button>
+              <button
+                className="btn"
+                onClick={() => {
+                  if (!fileInputRef.current) return
+                  fileInputRef.current.value = ''
+                  fileInputRef.current.click()
+                }}
+              >
+                큐시트 불러오기(JSON)
+              </button>
+              <div className="hint">로컬스토리지에 이전 작업이 있으면 자동 복원됩니다.</div>
+            </div>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="application/json"
+              style={{ display: 'none' }}
+              onChange={async (e) => {
+                const f = e.currentTarget.files?.[0]
+                if (!f) return
+                try {
+                  await onImportRundownFile(f)
+                } catch (err) {
+                  alert(err instanceof Error ? err.message : '불러오기에 실패했습니다.')
+                }
+              }}
+            />
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  const delta = computed.deltaSeconds
+  const currentPlayingId =
+    play.state !== 'idle' && includedRows[play.currentIncludedIndex] ? includedRows[play.currentIncludedIndex]!.item.id : null
+
+  return (
+    <div className="appShell">
+      <div className="topBar">
+        <div className="brand">
+          <div className="brandTitle">{rundown.programName}</div>
+          <div className="brandSub">{rundown.broadcastDate}</div>
+        </div>
+
+        <div className="metrics">
+          <div className="metric">
+            <div className="label">뉴스 시작</div>
+            <div className="value mono">{rundown.timing.newsStartTime}</div>
+          </div>
+          <div className="metric">
+            <div className="label">편성시간</div>
+            <div className="value mono">{formatSeconds(rundown.timing.scheduledSeconds)}</div>
+          </div>
+          <div className="metric">
+            <div className="label">진행시간</div>
+            <div className="value mono">{formatSeconds(computed.includedTotalSeconds)}</div>
+          </div>
+          <div className="metric">
+            <div className="label">편성대비</div>
+            <div className={delta < 0 ? 'value mono ok' : 'value mono bad'}>{formatDelta(delta)}</div>
+          </div>
+        </div>
+
+        <div className="topActions">
+          <button
+            className="btn subtle"
+            onClick={() => setAutoFollow((v) => !v)}
+            title={autoFollow ? '자동 스크롤 끄기(수동 보기)' : '자동 스크롤 켜기(진행 따라가기)'}
+            disabled={play.state === 'idle'}
+          >
+            {autoFollow ? '따라가기:ON' : '따라가기:OFF'}
+          </button>
+          <button
+            className="btn subtle"
+            onClick={() => {
+              setProgramId(null)
+              setRundown(null)
+              setSelectedItemId(null)
+              setPlay({ state: 'idle', currentIncludedIndex: 0, itemStartedAtMs: null, pausedAtMs: null, pausedAccumulatedMs: 0 })
+            }}
+            title="프로그램 선택 화면으로 나가기"
+          >
+            뉴스나가기
+          </button>
+          <button className="btn" onClick={saveCurrentAsTemplate} title="현재 큐시트를 템플릿으로 저장">
+            템플릿 저장
+          </button>
+          <button className="btn" onClick={startNewsNow} title="현재 시간으로 뉴스 시작">
+            뉴스시작
+          </button>
+          <button className="btn subtle" onClick={togglePause} disabled={play.state === 'idle'}>
+            {play.state === 'paused' ? '재개' : '포즈'}
+          </button>
+          <button className="btn subtle" onClick={nextItemNow} disabled={play.state === 'idle'}>
+            다음 아이템
+          </button>
+          <button
+            className="btn"
+            onClick={() => {
+              exportRundown()
+            }}
+          >
+            내보내기
+          </button>
+          <button
+            className="btn"
+            onClick={() => {
+              if (!fileInputRef.current) return
+              fileInputRef.current.value = ''
+              fileInputRef.current.click()
+            }}
+          >
+            불러오기
+          </button>
+          <button
+            className="btn subtle"
+            onClick={() => {
+              const p = PROGRAMS.find((x) => x.id === programId)
+              if (!p) return
+              if (!confirm('템플릿으로 초기화할까요? (현재 작업은 로컬에 덮어씁니다)')) return
+              setFromTemplate(p)
+            }}
+          >
+            초기화
+          </button>
+        </div>
+      </div>
+
+      <div className="page">
+        <div className="panel rundownPanel">
+          <div className="panelHeader">
+            <div className="panelTitle">큐시트</div>
+            <div className="panelMeta">
+              <span className="tag mono">오차목표 ±{rundown.timing.toleranceSeconds}s</span>
+              <span className="tag mono">행 {rundown.items.length}</span>
+            </div>
+          </div>
+
+          <div className="table">
+            <div className="thead">
+              <div>순서</div>
+              <div>구분</div>
+              <div>기자</div>
+              <div>제목</div>
+              <div className="right">시작</div>
+              <div>비고</div>
+              <div className="right">조작</div>
+            </div>
+
+            {(() => {
+              const rows = computed.rows
+              const endIdx = rows.findIndex((r) => r.item.kind === 'marker' && r.item.title === '뉴스끝')
+              const beforeEnd = endIdx >= 0 ? rows.slice(0, endIdx) : rows
+              const endRow = endIdx >= 0 ? rows[endIdx] : null
+              const afterEnd = endIdx >= 0 ? rows.slice(endIdx + 1) : []
+              const pinnedAfter = afterEnd.slice(0, 2)
+
+              let displayNo = 0
+              const renderRow = (row: (typeof rows)[number]) => {
+                const it = row.item
+                const isMarkerEnd = it.kind === 'marker' && it.title === '뉴스끝'
+                const isAfterEnd = row.isAfterEnd
+                const start = row.startTime ?? null
+                const duration = it.kind === 'newsItem' || it.kind === 'sectionHeader' ? it.durationSeconds : 0
+                const isCurrent = currentPlayingId != null && it.id === currentPlayingId
+                const emphasis = it.kind === 'newsItem' ? it.isEmphasis : false
+                const selected = selectedItemId != null && it.id === selectedItemId
+
+                const showNumber = it.kind === 'newsItem'
+                if (showNumber) displayNo += 1
+
+                return (
+                  <div
+                    key={it.id}
+                    id={`row-${it.id}`}
+                    className={[
+                      'tr',
+                      it.kind,
+                      isMarkerEnd ? 'markerEnd' : '',
+                      isAfterEnd ? 'afterEnd' : '',
+                      isCurrent ? 'current' : '',
+                      emphasis ? 'emphasis' : '',
+                      selected ? 'selected' : '',
+                    ].join(' ')}
+                    onMouseDown={() => setSelectedItemId(it.id)}
+                  >
+                    <div className="mono">{showNumber ? String(displayNo).padStart(2, '0') : ''}</div>
+                    <div>
+                      {it.kind === 'newsItem' ? (
+                        <select
+                          className="select"
+                          value={it.category}
+                          onChange={(e) => {
+                            const v = e.target.value
+                            setRundownSafe((prev) => ({
+                              ...prev,
+                              items: prev.items.map((x) =>
+                                x.id === it.id && x.kind === 'newsItem'
+                                  ? { ...x, category: v, durationSeconds: defaultDurationForCategory(v) }
+                                  : x,
+                              ),
+                            }))
+                          }}
+                        >
+                          <option value="완제">완제</option>
+                          <option value="단신">단신</option>
+                          <option value=""></option>
+                        </select>
+                      ) : (
+                        <span className="muted">{it.kind === 'marker' ? it.title : ''}</span>
+                      )}
+                    </div>
+                    <div>
+                      {it.kind === 'newsItem' ? (
+                        <input
+                          className="input"
+                          value={it.reporter}
+                          onChange={(e) => {
+                            const v = e.target.value
+                            setRundownSafe((prev) => ({
+                              ...prev,
+                              items: prev.items.map((x) =>
+                                x.id === it.id && x.kind === 'newsItem' ? { ...x, reporter: v } : x,
+                              ),
+                            }))
+                          }}
+                        />
+                      ) : (
+                        <span className="muted">{it.kind === 'marker' ? it.title : ''}</span>
+                      )}
+                    </div>
+                    <div className="titleCell">
+                      {it.kind === 'newsItem' ? (
+                        <div className="titleWrap">
+                          <input
+                            className="input"
+                            id={`title-${it.id}`}
+                            value={it.title}
+                            onChange={(e) => {
+                              const v = e.target.value
+                              setRundownSafe((prev) => ({
+                                ...prev,
+                                items: prev.items.map((x) =>
+                                  x.id === it.id && x.kind === 'newsItem' ? { ...x, title: v } : x,
+                                ),
+                              }))
+                            }}
+                          />
+                          {it.isDefaultItem ? <span className="badge">기본</span> : null}
+                          {!it.includeInRun || isAfterEnd ? <span className="badge off">제외</span> : null}
+                          <span className="durPill mono" title="길이(mm:ss)">
+                            {formatSeconds(duration)}
+                          </span>
+                        </div>
+                      ) : it.kind === 'sectionHeader' ? (
+                        <div className="titleWrap">
+                          <input
+                            className="input"
+                            id={`title-${it.id}`}
+                            value={it.title}
+                            onChange={(e) => {
+                              const v = e.target.value
+                              setRundownSafe((prev) => ({
+                                ...prev,
+                                items: prev.items.map((x) =>
+                                  x.id === it.id && x.kind === 'sectionHeader' ? { ...x, title: v } : x,
+                                ),
+                              }))
+                            }}
+                          />
+                          <span className="durPill mono" title="길이(mm:ss)">
+                            {formatSeconds(duration)}
+                          </span>
+                        </div>
+                      ) : (
+                        <span className="muted">{it.kind === 'blank' ? '' : it.title}</span>
+                      )}
+                    </div>
+
+                    <div className="right mono">{start ? start : ''}</div>
+                    <div>
+                      {it.kind === 'newsItem' ? (
+                        <input
+                          className="input"
+                          value={it.notes}
+                          onChange={(e) => {
+                            const v = e.target.value
+                            setRundownSafe((prev) => ({
+                              ...prev,
+                              items: prev.items.map((x) =>
+                                x.id === it.id && x.kind === 'newsItem' ? { ...x, notes: v } : x,
+                              ),
+                            }))
+                          }}
+                        />
+                      ) : (
+                        ''
+                      )}
+                    </div>
+                    <div className="right">
+                      <div className="actions">
+                        {it.kind === 'newsItem' ? (
+                          <label className="emChk" title="글자 크게(+5pt)">
+                            <input
+                              type="checkbox"
+                              checked={it.isEmphasis}
+                              onChange={(e) => {
+                                const checked = e.target.checked
+                                setRundownSafe((prev) => ({
+                                  ...prev,
+                                  items: prev.items.map((x) =>
+                                    x.id === it.id && x.kind === 'newsItem' ? { ...x, isEmphasis: checked } : x,
+                                  ),
+                                }))
+                              }}
+                            />
+                          </label>
+                        ) : null}
+                        {it.kind === 'newsItem' || it.kind === 'sectionHeader' ? (
+                          <DurationEditor
+                            valueSeconds={duration}
+                            onDelta={(d) => {
+                              setRundownSafe((prev) => ({
+                                ...prev,
+                                items: prev.items.map((x) =>
+                                  x.id === it.id && (x.kind === 'newsItem' || x.kind === 'sectionHeader')
+                                    ? { ...x, durationSeconds: Math.max(0, x.durationSeconds + d) }
+                                    : x,
+                                ),
+                              }))
+                            }}
+                          />
+                        ) : null}
+                        {it.kind === 'newsItem' ? (
+                          <button
+                            className="iconBtn"
+                            title={it.includeInRun && !isAfterEnd ? '진행 제외' : '진행 포함'}
+                            onClick={() => {
+                              setRundownSafe((prev) => ({
+                                ...prev,
+                                items: prev.items.map((x) =>
+                                  x.id === it.id && x.kind === 'newsItem' ? { ...x, includeInRun: !x.includeInRun } : x,
+                                ),
+                              }))
+                            }}
+                          >
+                            {it.includeInRun ? '✓' : '⏸'}
+                          </button>
+                        ) : null}
+                        {!isMarkerEnd ? (
+                          <button
+                            className="iconBtn danger"
+                            title="삭제"
+                            onClick={() => {
+                              setRundownSafe((prev) => ({
+                                ...prev,
+                                items: prev.items.filter((x) => x.id !== it.id),
+                              }))
+                            }}
+                          >
+                            ✕
+                          </button>
+                        ) : null}
+                      </div>
+                    </div>
+                  </div>
+                )
+              }
+
+              return (
+                <>
+                  <div
+                    ref={tableScrollRef}
+                    className="tableScroll"
+                    onScroll={() => {
+                      // user manual scroll disables follow until toggled back on
+                      if (autoFollow && play.state !== 'idle') setAutoFollow(false)
+                    }}
+                  >
+                    {beforeEnd.map(renderRow)}
+                  </div>
+
+                  <div className="tablePinned">
+                    {endRow ? renderRow(endRow) : null}
+                    {pinnedAfter.map(renderRow)}
+                    {afterEnd.length > 2 ? <div className="pinnedMore muted">… 뉴스끝 아래 {afterEnd.length - 2}개 더 있음</div> : null}
+
+                    <div className="footerBar pinnedFooter">
+                      <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
+                        <button
+                          className="btn subtle"
+                          disabled={!selectedItemId}
+                          onClick={() => moveSelected(-1)}
+                          title="선택한 아이템 위로"
+                        >
+                          위로
+                        </button>
+                        <button
+                          className="btn subtle"
+                          disabled={!selectedItemId}
+                          onClick={() => moveSelected(1)}
+                          title="선택한 아이템 아래로"
+                        >
+                          아래로
+                        </button>
+                        <button
+                          className="btn subtle"
+                          disabled={!selectedItemId || !!selectedRow?.isAfterEnd}
+                          onClick={takeOutToAfterEnd}
+                          title="뉴스끝 아래로 빼기(시간계산 제외)"
+                        >
+                          빼기
+                        </button>
+                        <button
+                          className="btn subtle"
+                          disabled={!selectedItemId || !selectedRow?.isAfterEnd}
+                          onClick={putBackBeforeEnd}
+                          title="뉴스끝 바로 위로 넣기"
+                        >
+                          넣기
+                        </button>
+                        <button
+                          className="btn"
+                          onClick={() => {
+                            const newItem: RundownItem = {
+                              id: uid('i_'),
+                              kind: 'newsItem',
+                              category: '완제',
+                              reporter: '',
+                              title: '',
+                              durationSeconds: 90,
+                              notes: '',
+                              isDefaultItem: false,
+                              isEmphasis: false,
+                              includeInRun: true,
+                              flags: [],
+                            }
+                            setRundownSafe((prev) => ({
+                              ...prev,
+                              items: insertAfterSelectedOrBeforeEnd(prev.items, selectedItemId, newItem),
+                            }))
+                            setSelectedItemId(newItem.id)
+                            setFocusItemId(newItem.id)
+                          }}
+                        >
+                          아이템 추가
+                        </button>
+                        <button
+                          className="btn subtle"
+                          onClick={() => {
+                            const blank: RundownItem = { id: uid('b_'), kind: 'blank', title: '', includeInRun: false }
+                            setRundownSafe((prev) => ({
+                              ...prev,
+                              items: insertAfterSelectedOrBeforeEnd(prev.items, selectedItemId, blank),
+                            }))
+                            setSelectedItemId(blank.id)
+                          }}
+                        >
+                          빈줄
+                        </button>
+                        <button
+                          className="btn subtle"
+                          onClick={() => {
+                            const header: RundownItem = {
+                              id: uid('s_'),
+                              kind: 'sectionHeader',
+                              title: '섹션',
+                              durationSeconds: 0,
+                              includeInRun: false,
+                            }
+                            setRundownSafe((prev) => ({ ...prev, items: insertBeforeMarkerEnd(prev.items, header) }))
+                          }}
+                        >
+                          섹션 헤더
+                        </button>
+                      </div>
+
+                      <div className="row" style={{ gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+                        <label className="field">
+                          <span className="fieldLabel">뉴스 시작</span>
+                          <input
+                            className="input mono"
+                            value={newsStartDraft}
+                            onChange={(e) => {
+                              setNewsStartDraft(e.target.value)
+                            }}
+                            onFocus={(e) => {
+                              e.currentTarget.select()
+                            }}
+                            onBlur={() => {
+                              const v = newsStartDraft
+                              setRundownSafe((prev) => ({
+                                ...prev,
+                                timing: { ...prev.timing, newsStartTime: v },
+                              }))
+                            }}
+                          />
+                        </label>
+                        <label className="field">
+                          <span className="fieldLabel">편성(mm:ss)</span>
+                          <input
+                            className="input mono"
+                            value={scheduledDraft}
+                            onChange={(e) => {
+                              setScheduledDraft(e.target.value)
+                            }}
+                            onFocus={(e) => {
+                              e.currentTarget.select()
+                            }}
+                            onBlur={() => {
+                              const secs = parseTimeToSeconds(scheduledDraft)
+                              if (secs == null) {
+                                setScheduledDraft(formatSeconds(rundown.timing.scheduledSeconds))
+                                return
+                              }
+                              setRundownSafe((prev) => ({
+                                ...prev,
+                                timing: { ...prev.timing, scheduledSeconds: secs },
+                              }))
+                            }}
+                          />
+                        </label>
+                      </div>
+                    </div>
+                  </div>
+                </>
+              )
+            })()}
+        </div>
+      </div>
+      </div>
+
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="application/json"
+        style={{ display: 'none' }}
+        onChange={async (e) => {
+          const f = e.currentTarget.files?.[0]
+          if (!f) return
+          try {
+            await onImportRundownFile(f)
+          } catch (err) {
+            alert(err instanceof Error ? err.message : '불러오기에 실패했습니다.')
+          }
+        }}
+      />
+    </div>
+  )
+}
+
+function insertBeforeMarkerEnd(items: RundownItem[], newItem: RundownItem): RundownItem[] {
+  const idx = items.findIndex((x) => x.kind === 'marker' && x.title === '뉴스끝')
+  if (idx < 0) return [...items, newItem]
+  const out = [...items]
+  out.splice(idx, 0, newItem)
+  return out
+}
+
+function DurationEditor(props: {
+  valueSeconds: number
+  onDelta: (deltaSeconds: number) => void
+}) {
+  return (
+    <div className="dur">
+      <div className="durBtns">
+        <button className="miniBtn" onClick={() => props.onDelta(-10)}>
+          -10
+        </button>
+        <button className="miniBtn" onClick={() => props.onDelta(-5)}>
+          -5
+        </button>
+        <button className="miniBtn" onClick={() => props.onDelta(5)}>
+          +5
+        </button>
+        <button className="miniBtn" onClick={() => props.onDelta(10)}>
+          +10
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function insertAfterSelectedOrBeforeEnd(
+  items: RundownItem[],
+  selectedId: string | null,
+  newItem: RundownItem,
+): RundownItem[] {
+  if (!selectedId) return insertBeforeMarkerEnd(items, newItem)
+  const idx = items.findIndex((x) => x.id === selectedId)
+  if (idx < 0) return insertBeforeMarkerEnd(items, newItem)
+
+  // if selected is 뉴스끝, still insert before it
+  const selected = items[idx]
+  if (selected?.kind === 'marker' && selected.title === '뉴스끝') {
+    return insertBeforeMarkerEnd(items, newItem)
+  }
+
+  const out = [...items]
+  out.splice(idx + 1, 0, newItem)
+  return out
+}
+
+export default App

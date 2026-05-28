@@ -1,0 +1,53 @@
+{
+  "schemaVersion": "1.0",
+  "type": "template",
+  "programId": "news_economy",
+  "programName": "뉴스와 경제",
+  "createdAt": "2026-05-28T00:00:00Z",
+  "updatedAt": "2026-05-28T00:00:00Z",
+  "defaults": {
+    "scheduledSeconds": 3060,
+    "newsStartTime": "20:00:00"
+  },
+  "items": [
+    { "id": "sec_opening", "kind": "sectionHeader", "title": "오프닝", "includeInRun": false },
+    {
+      "id": "item_title",
+      "kind": "newsItem",
+      "category": "기타",
+      "reporter": "",
+      "title": "타이틀",
+      "durationSeconds": 20,
+      "notes": "",
+      "isDefaultItem": true,
+      "includeInRun": true,
+      "flags": []
+    },
+    {
+      "id": "item_ad",
+      "kind": "newsItem",
+      "category": "기타",
+      "reporter": "",
+      "title": "광고/CM",
+      "durationSeconds": 60,
+      "notes": "",
+      "isDefaultItem": true,
+      "includeInRun": true,
+      "flags": []
+    },
+    {
+      "id": "item_closing",
+      "kind": "newsItem",
+      "category": "기타",
+      "reporter": "",
+      "title": "클로징",
+      "durationSeconds": 20,
+      "notes": "",
+      "isDefaultItem": true,
+      "includeInRun": true,
+      "flags": []
+    },
+    { "id": "marker_end", "kind": "marker", "title": "뉴스끝", "includeInRun": false }
+  ]
+}
+
