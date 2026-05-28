@@ -490,21 +490,41 @@ function App() {
     }
   }
 
+  async function getAllKnownTemplateIds(): Promise<string[]> {
+    const idsFromIndex = await loadPublicTemplatesIndex()
+    const idsFromPrograms = programs.map((p) => p.id)
+    const seen = new Set<string>()
+    for (const id of [...idsFromIndex, ...idsFromPrograms]) {
+      if (typeof id === 'string' && id.trim() !== '') seen.add(id)
+    }
+    return [...seen]
+  }
+
   async function ensureAllTemplatesSavedToLocal() {
-    const ids = await loadPublicTemplatesIndex()
+    const ids = await getAllKnownTemplateIds()
+    let saved = 0
     for (const id of ids) {
       const already = loadTemplateFromStorage(id)
       if (already) continue
       const t = await loadTemplateFromPublic(id)
-      if (t) localStorage.setItem(storageKeyForTemplate(id), JSON.stringify(t))
+      if (t) {
+        localStorage.setItem(storageKeyForTemplate(id), JSON.stringify(t))
+        saved += 1
+      }
     }
-    alert('기본 템플릿을 모두 로컬에 저장했습니다.')
+    alert(`템플릿을 모두 로컬에 저장했습니다. (추가 저장 ${saved}개)`)
   }
 
-  function exportAllTemplates() {
+  async function exportAllTemplates() {
+    const ids = await getAllKnownTemplateIds()
     const templates: Template[] = []
-    for (const p of programs) {
-      const t = loadTemplateFromStorage(p.id)
+    for (const id of ids) {
+      const local = loadTemplateFromStorage(id)
+      if (local) {
+        templates.push(local)
+        continue
+      }
+      const t = await loadTemplateFromPublic(id)
       if (t) templates.push(t)
     }
     const bundle: TemplatesBundle = { schemaVersion: '1.0', type: 'templatesBundle', templates }
@@ -780,6 +800,16 @@ function App() {
               ))}
             </div>
             <div className="row" style={{ marginTop: 12, gap: 10, flexWrap: 'wrap' }}>
+              <button
+                className="btn subtle"
+                onClick={() => void ensureAllTemplatesSavedToLocal()}
+                title="GitHub에 커밋된 기본 템플릿 + 추가된 프로그램 템플릿을 로컬에 저장"
+              >
+                템플릿 전체 저장
+              </button>
+              <button className="btn subtle" onClick={() => void exportAllTemplates()} title="알려진 모든 템플릿을 한 파일로 내보내기">
+                템플릿 전체 내보내기
+              </button>
               <input
                 className="input"
                 placeholder="새 프로그램 이름"
@@ -887,12 +917,6 @@ function App() {
           <span className="tag mono" title="뉴스끝 이전, includeInRun=true인 전체 아이템(뉴스+섹션) 합계">
             합계 {formatSeconds(computed.includedTotalSeconds)}
           </span>
-          <button className="btn subtle" onClick={() => void ensureAllTemplatesSavedToLocal()} title="배포 기본 템플릿을 모두 로컬에 저장">
-            템플릿 전체 저장
-          </button>
-          <button className="btn subtle" onClick={exportAllTemplates} title="현재 로컬에 저장된 모든 템플릿을 파일로 내보내기">
-            템플릿 전체 내보내기
-          </button>
           <button
             className="btn subtle"
             onClick={() => {
