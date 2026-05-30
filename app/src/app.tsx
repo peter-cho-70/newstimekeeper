@@ -479,58 +479,6 @@ function App() {
     }
   }
 
-  async function loadPublicTemplatesIndex(): Promise<string[]> {
-    try {
-      const res = await fetch('/templates/index.json', { cache: 'no-store' })
-      if (!res.ok) return []
-      const parsed = (await res.json()) as any
-      const ids = Array.isArray(parsed?.programIds) ? parsed.programIds : []
-      return ids.filter((x: any) => typeof x === 'string')
-    } catch {
-      return []
-    }
-  }
-
-  async function getAllKnownTemplateIds(): Promise<string[]> {
-    const idsFromIndex = await loadPublicTemplatesIndex()
-    const idsFromPrograms = programs.map((p) => p.id)
-    const seen = new Set<string>()
-    for (const id of [...idsFromIndex, ...idsFromPrograms]) {
-      if (typeof id === 'string' && id.trim() !== '') seen.add(id)
-    }
-    return [...seen]
-  }
-
-  async function ensureAllTemplatesSavedToLocal() {
-    const ids = await getAllKnownTemplateIds()
-    let saved = 0
-    for (const id of ids) {
-      const already = loadTemplateFromStorage(id)
-      if (already) continue
-      const t = await loadTemplateFromPublic(id)
-      if (t) {
-        localStorage.setItem(storageKeyForTemplate(id), JSON.stringify(t))
-        saved += 1
-      }
-    }
-    alert(`템플릿을 모두 로컬에 저장했습니다. (추가 저장 ${saved}개)`)
-  }
-
-  async function exportAllTemplates() {
-    const ids = await getAllKnownTemplateIds()
-    const templates: Template[] = []
-    for (const id of ids) {
-      const local = loadTemplateFromStorage(id)
-      if (local) {
-        templates.push(local)
-        continue
-      }
-      const t = await loadTemplateFromPublic(id)
-      if (t) templates.push(t)
-    }
-    const bundle: TemplatesBundle = { schemaVersion: '1.0', type: 'templatesBundle', templates }
-    downloadJson(`templates_all_${new Date().toISOString().slice(0, 10)}.json`, bundle)
-  }
 
   async function onPickProgram(p: ProgramDef) {
     // B안: 프로그램 선택 화면 → 동일 메인 화면.
@@ -602,7 +550,10 @@ function App() {
   function exportTemplate() {
     if (!rundown || !programId) return
     const t = rundownToTemplate(rundown)
-    const filename = `template_${t.programId}_${uid('x_')}.json`
+    const now = new Date()
+    const ts = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}_${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}${String(now.getSeconds()).padStart(2, '0')}`
+    const safeName = (t.programName ?? t.programId).replace(/[\\/:*?"<>|]/g, '_')
+    const filename = `template_${safeName}_${ts}.json`
     downloadJson(filename, t)
   }
 
@@ -614,19 +565,23 @@ function App() {
     }
     if (parsed?.type === 'template') {
       const t = normalizeTemplate(parsed as Template)
-      const pId = t.programId as ProgramId
-      localStorage.setItem(storageKeyForTemplate(pId), JSON.stringify(t))
-      // Apply immediately?
-      if (confirm('템플릿을 저장했습니다. 지금 바로 이 템플릿으로 큐시트를 열까요?')) {
-        const rd = cloneTemplateToRundown(t)
-        setProgramId(pId)
-        setRundown(rd)
-        localStorage.setItem(storageKeyForRundown(pId), JSON.stringify(rd))
-        setPlay({ state: 'idle', currentIncludedIndex: 0, itemStartedAtMs: null, pausedAtMs: null, pausedAccumulatedMs: 0 })
-        setSelectedItemId(null)
-      } else {
-        alert('템플릿을 저장했습니다. 다음에 프로그램을 열면 자동으로 이 템플릿이 열립니다.')
+      // 현재 열려 있는 프로그램에 아이템을 적용 (programId 불일치 허용)
+      const targetPId = programId ?? (t.programId as ProgramId)
+      const targetName = programs.find((p) => p.id === targetPId)?.name ?? t.programName
+      // 현재 프로그램 기준으로 rundown 구성 (아이템만 그대로 가져옴)
+      const rd: Rundown = {
+        ...cloneTemplateToRundown(t),
+        programId: targetPId,
+        programName: targetName,
       }
+      setProgramId(targetPId)
+      setRundown(rd)
+      localStorage.setItem(storageKeyForRundown(targetPId), JSON.stringify(rd))
+      // 현재 프로그램용 템플릿으로도 저장
+      const savedTemplate: Template = { ...t, programId: targetPId, programName: targetName }
+      localStorage.setItem(storageKeyForTemplate(targetPId), JSON.stringify(savedTemplate))
+      setPlay({ state: 'idle', currentIncludedIndex: 0, itemStartedAtMs: null, pausedAtMs: null, pausedAccumulatedMs: 0 })
+      setSelectedItemId(null)
       return
     }
     if (parsed?.type === 'templatesBundle' && Array.isArray(parsed?.templates)) {
@@ -796,32 +751,10 @@ function App() {
               {programs.map((p) => (
                 <button key={p.id} className="programBtn" onClick={() => void onPickProgram(p)}>
                   <div className="programName">{p.name}</div>
-                  <div className="programMeta">템플릿 자동 로딩(있으면) · 없으면 빈 큐시트</div>
                 </button>
               ))}
             </div>
             <div className="row" style={{ marginTop: 12, gap: 10, flexWrap: 'wrap' }}>
-              <button
-                className="btn subtle"
-                onClick={() => void ensureAllTemplatesSavedToLocal()}
-                title="GitHub에 커밋된 기본 템플릿 + 추가된 프로그램 템플릿을 로컬에 저장"
-              >
-                템플릿 전체 저장
-              </button>
-              <button className="btn subtle" onClick={() => void exportAllTemplates()} title="알려진 모든 템플릿을 한 파일로 내보내기">
-                템플릿 전체 내보내기
-              </button>
-              <button
-                className="btn subtle"
-                onClick={() => {
-                  if (!templatesFileInputRef.current) return
-                  templatesFileInputRef.current.value = ''
-                  templatesFileInputRef.current.click()
-                }}
-                title="내보낸 템플릿 번들(JSON)을 로컬 파일에서 불러오기"
-              >
-                템플릿 전체 불러오기
-              </button>
               <input
                 className="input"
                 placeholder="새 프로그램 이름"
