@@ -51,11 +51,6 @@ function storageKeyForTemplate(programId: ProgramId) {
   return `${TEMPLATE_KEY_PREFIX}${programId}`
 }
 
-type TemplatesBundle = {
-  schemaVersion: string
-  type: 'templatesBundle'
-  templates: Template[]
-}
 
 function nowClockHHMMSS() {
   const d = new Date()
