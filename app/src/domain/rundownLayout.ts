@@ -1,4 +1,5 @@
 import type { RundownItem } from './types'
+import { CATEGORY_BLANK, isArticleCategory, isStructuralCategory } from './cueCategories'
 import { uid } from './uid'
 
 export function createBlankItem(): RundownItem {
@@ -15,11 +16,14 @@ function pushBlankIfNeeded(out: RundownItem[]) {
 }
 
 function isMainNewsItem(it: RundownItem): boolean {
-  return it.kind === 'newsItem' && (it.category === '완제' || it.category === '단신')
+  return it.kind === 'newsItem' && isArticleCategory(it.category)
 }
 
 function isStructuralItem(it: RundownItem): boolean {
-  return it.kind === 'newsItem' && it.category === ''
+  return (
+    it.kind === 'newsItem' &&
+    (isStructuralCategory(it.category) || it.category === '' || it.category === CATEGORY_BLANK)
+  )
 }
 
 /**

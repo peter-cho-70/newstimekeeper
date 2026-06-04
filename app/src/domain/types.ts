@@ -23,6 +23,8 @@ export type TemplateItem =
       isTimeAdjust: boolean
       includeInRun: boolean
       flags: string[]
+      /** PDF 큐시트 줄 번호(1–20 등). 표시·정렬용 */
+      cueNo?: number
       article?: ArticleScript
     }
   | { id: string; kind: 'blank'; title: string; includeInRun: false }
@@ -57,6 +59,7 @@ export type RundownItem =
       isTimeAdjust: boolean
       includeInRun: boolean
       flags: string[]
+      cueNo?: number
       article?: ArticleScript
     }
   | { id: string; kind: 'blank'; title: string; includeInRun: false }

@@ -1,0 +1,16 @@
+{
+  "schemaVersion": "1.0",
+  "type": "template",
+  "programId": "news_today",
+  "programName": "뉴스투데이",
+  "createdAt": "2026-06-04T00:00:00Z",
+  "updatedAt": "2026-06-04T00:00:00Z",
+  "defaults": {
+    "scheduledSeconds": 3600,
+    "newsStartTime": "20:00:00"
+  },
+  "items": [
+    { "id": "sec_open", "kind": "sectionHeader", "title": "1부", "durationSeconds": 0, "includeInRun": false },
+    { "id": "end", "kind": "marker", "title": "뉴스끝", "includeInRun": false }
+  ]
+}

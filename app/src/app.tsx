@@ -11,10 +11,19 @@ import {
   parseTimeToSeconds,
 } from './domain/time'
 import { NEWS_ECONOMY_TEMPLATE, NEWS_EXTRA_TEMPLATE } from './templates'
-import { downloadJson, readJsonFile } from './domain/file'
+import { readJsonFile } from './domain/file'
 import { parsePdfToRundown } from './domain/pdfRundownParser'
 import { applyActualDurationsFromPlay, hasPlaybackDurationData } from './domain/playbackApply'
-import { insertVisualBlankSeparators } from './domain/rundownLayout'
+import {
+  CATEGORY_BLANK,
+  CUE_CATEGORIES,
+  categoryLabelForUi,
+  defaultDurationForBlankSlot,
+  defaultDurationForCategory,
+  isArticleCategory,
+  isBlankSlotCategory,
+  normalizeNewsCategory,
+} from './domain/cueCategories'
 import { uid } from './domain/uid'
 
 type ProgramId = string
@@ -28,32 +37,23 @@ const BUILTIN_PROGRAMS: ProgramDef[] = [
   { id: 'news_930', name: '930뉴스', builtIn: true },
   { id: 'news_desk', name: '뉴스데스크', builtIn: true },
   { id: 'news_25', name: '뉴스25', builtIn: true },
+  { id: 'news_today', name: '뉴스투데이', builtIn: true },
 ]
 
 const PROGRAMS_KEY = 'newstimekeeper:programs:v1'
 
-const DEFAULT_DURATION_BY_CATEGORY: Record<string, number> = {
-  완제: 90,
-  단신: 30,
-  '': 0,
-  공란: 0, // backward compat (older saved data)
-}
-
-function defaultDurationForCategory(category: string): number {
-  return DEFAULT_DURATION_BY_CATEGORY[category] ?? 90
-}
-
 function isArticleNewsItem(it: RundownItem): it is RundownItem & { kind: 'newsItem' } {
-  return it.kind === 'newsItem' && (it.category === '완제' || it.category === '단신')
+  return it.kind === 'newsItem' && isArticleCategory(it.category)
 }
 
 function guessProgramIdFromPdfName(filename: string): ProgramId {
-  if (/12|12시/i.test(filename)) return 'news_12'
+  if (/outside|외전/i.test(filename)) return 'news_extra'
+  if (/today|투데이/i.test(filename)) return 'news_today'
   if (/930/i.test(filename)) return 'news_930'
-  if (/25/i.test(filename)) return 'news_25'
-  if (/데스크/i.test(filename)) return 'news_desk'
-  if (/외전/i.test(filename)) return 'news_extra'
-  if (/경제/i.test(filename)) return 'news_economy'
+  if (/news25|뉴스25|^25/i.test(filename)) return 'news_25'
+  if (/desk|데스크/i.test(filename)) return 'news_desk'
+  if (/경제|economy/i.test(filename)) return 'news_economy'
+  if (/12|12시/i.test(filename)) return 'news_12'
   return 'news_12'
 }
 
@@ -173,6 +173,9 @@ function isEditableKeyboardTarget(target: EventTarget | null): boolean {
   return t.isContentEditable
 }
 
+/** 진행 중 입력 없을 때: 선택을 현재 아이템으로 맞춤 · 편집 후 스페이스 = 다음 아이템 */
+const SPACE_ADVANCE_IDLE_MS = 5_000
+
 function toAsciiSlug(input: string): string {
   return input
     .toLowerCase()
@@ -230,17 +233,28 @@ function normalizeRundown(r: Rundown): Rundown {
       ? r.timing.newsEndTime
       : defaultNewsEndTime(newsStartTime, scheduledSeconds)
 
-  let timeAdjustSeen = false
   const items = r.items.map((it) => {
     if (it.kind === 'sectionHeader') {
       const dur = typeof (it as any).durationSeconds === 'number' ? (it as any).durationSeconds : 0
       return { ...it, durationSeconds: dur }
     }
     if (it.kind === 'newsItem') {
-      const raw = (it as { isTimeAdjust?: boolean }).isTimeAdjust === true
-      const isTimeAdjust = raw && !timeAdjustSeen
-      if (isTimeAdjust) timeAdjustSeen = true
-      return { ...it, isTimeAdjust }
+      const category = normalizeNewsCategory(it.category, it.title)
+      const anchorDur = defaultDurationForBlankSlot({
+        notes: it.notes,
+        reporter: it.reporter,
+        title: it.title,
+      })
+      const durationSeconds =
+        isBlankSlotCategory(category) && !it.title.trim() && anchorDur > 0 && it.durationSeconds === 0
+          ? anchorDur
+          : it.durationSeconds
+      return {
+        ...it,
+        category,
+        durationSeconds,
+        isTimeAdjust: false,
+      }
     }
     return it
   })
@@ -334,6 +348,9 @@ function App() {
   const [play, setPlay] = useState<PlaySession>(() => idlePlaySession())
   const [advanceMode, setAdvanceMode] = useState<AdvanceMode>('manual')
   const autoStartLatchRef = useRef<string | null>(null)
+  const playStateRef = useRef<PlayState>('idle')
+  const lastUserActivityAtMsRef = useRef(Date.now())
+  const itemEditedDuringPlayRef = useRef(false)
 
   const [newsStartDraft, setNewsStartDraft] = useState<string>('20:00:00')
   const [scheduledDraft, setScheduledDraft] = useState<string>('51:00')
@@ -436,6 +453,47 @@ function App() {
     rundown?.timing.budgetMode,
   ])
 
+  const timingDraftDirty = useMemo(() => {
+    if (!rundown) return false
+    if (newsStartDraft.trim() !== rundown.timing.newsStartTime) return true
+    if (rundown.timing.budgetMode === 'endClock') {
+      return newsEndDraft.trim() !== rundown.timing.newsEndTime
+    }
+    const secs = parseTimeToSeconds(scheduledDraft)
+    return secs != null && secs !== rundown.timing.scheduledSeconds
+  }, [rundown, newsStartDraft, scheduledDraft, newsEndDraft])
+
+  function applyTimingEdits() {
+    if (!rundown) return
+    const start = newsStartDraft.trim()
+    if (!start) return
+
+    if (rundown.timing.budgetMode === 'endClock') {
+      const end = newsEndDraft.trim()
+      if (!end) return
+      setRundownSafe((prev) => ({
+        ...prev,
+        timing: { ...prev.timing, newsStartTime: start, newsEndTime: end },
+      }))
+      return
+    }
+
+    const secs = parseTimeToSeconds(scheduledDraft)
+    if (secs == null) {
+      setScheduledDraft(formatSeconds(rundown.timing.scheduledSeconds))
+      return
+    }
+    setRundownSafe((prev) => ({
+      ...prev,
+      timing: {
+        ...prev.timing,
+        newsStartTime: start,
+        scheduledSeconds: secs,
+        newsEndTime: defaultNewsEndTime(start, secs),
+      },
+    }))
+  }
+
   function moveSelected(delta: -1 | 1) {
     if (!rundown || selectedIndex == null || !selectedItemId) return
     if (isItemLockedDuringPlay(selectedItemId, play, includedRows)) return
@@ -511,10 +569,23 @@ function App() {
 
   const includedRows = useMemo(() => {
     if (!computed) return []
-    return computed.rows.filter((r) => r.isIncluded && (r.item.kind === 'newsItem' || r.item.kind === 'sectionHeader')) as Array<
+    return computed.rows.filter(
+      (r) =>
+        r.isIncluded &&
+        (r.item.kind === 'newsItem' || r.item.kind === 'sectionHeader') &&
+        r.item.includeInRun,
+    ) as Array<
       (typeof computed.rows)[number] & { item: Extract<RundownItem, { kind: 'newsItem' | 'sectionHeader' }> }
     >
   }, [computed])
+
+  const lastIncludedPlayIndex = Math.max(0, includedRows.length - 1)
+
+  const currentPlayingIdRef = useRef<string | null>(null)
+  currentPlayingIdRef.current =
+    play.state !== 'idle' && includedRows[play.currentIncludedIndex]
+      ? includedRows[play.currentIncludedIndex]!.item.id
+      : null
 
   const selectedRow = useMemo(() => {
     if (!computed || !selectedItemId) return null
@@ -593,7 +664,11 @@ function App() {
   function setRundownSafe(updater: (prev: Rundown) => Rundown) {
     setRundown((prev) => {
       if (!prev) return prev
-      const next = { ...updater(prev), updatedAt: new Date().toISOString() }
+      const updated = updater(prev)
+      if (playStateRef.current !== 'idle' && updated.items !== prev.items) {
+        itemEditedDuringPlayRef.current = true
+      }
+      const next = { ...updated, updatedAt: new Date().toISOString() }
       localStorage.setItem(storageKeyForRundown(next.programId as ProgramId), JSON.stringify(next))
       return next
     })
@@ -644,6 +719,12 @@ function App() {
 
   async function onPickProgram(p: ProgramDef) {
     // B안: 프로그램 선택 화면 → 동일 메인 화면.
+    // PDF 불러오기·마지막 작업 등으로 저장된 큐시트가 있으면 우선 복원한다.
+    if (tryLoadFromStorage(p.id)) {
+      setSelectedItemId(null)
+      return
+    }
+
     // 요구사항: "템플릿 저장"을 해두면 열 때마다 템플릿이 자동으로 열린다.
     const storedTemplate = loadTemplateFromStorage(p.id)
     if (storedTemplate) {
@@ -700,9 +781,12 @@ function App() {
     const normalized = normalizeRundown(merged)
     setProgramId(targetProgramId)
     setRundown(normalized)
-    localStorage.setItem(storageKeyForRundown(targetProgramId), JSON.stringify(normalized))
+    persistRundownAndTemplate(normalized, targetProgramId)
     setPlay(idlePlaySession())
     setSelectedItemId(null)
+    requestAnimationFrame(() => {
+      tableScrollRef.current?.scrollTo({ top: 0, behavior: 'smooth' })
+    })
   }
 
   async function onImportRundownFile(file: File) {
@@ -736,7 +820,17 @@ function App() {
       })
       const { includedTotalSeconds, deltaSeconds, budgetSeconds } = computeRundown(preview)
       const newsCount = preview.items.filter(
-        (it) => it.kind === 'newsItem' && (it.category === '완제' || it.category === '단신'),
+        (it) => it.kind === 'newsItem' && isArticleCategory(it.category),
+      ).length
+      const structCount = preview.items.filter(
+        (it) => it.kind === 'newsItem' && !isArticleCategory(it.category),
+      ).length
+      const timedCount = preview.items.filter(
+        (it) =>
+          (it.kind === 'newsItem' || it.kind === 'sectionHeader') && it.durationSeconds > 0,
+      ).length
+      const spareCount = preview.items.filter(
+        (it) => it.kind === 'newsItem' && it.flags.includes('spare') && it.includeInRun,
       ).length
       const ok = confirm(
         [
@@ -746,32 +840,19 @@ function App() {
           `방송일: ${preview.broadcastDate}`,
           `편성: ${formatSeconds(budgetSeconds)} · 본편 합계: ${formatSeconds(includedTotalSeconds)}`,
           `편성대비: ${formatDelta(deltaSeconds)}`,
-          `기사/단신 약 ${newsCount}건 · 전체 행 ${preview.items.length}개`,
+          `완제/단신 ${newsCount}건 · 오프닝·CM 등 ${structCount}건 · 시간 있는 행 ${timedCount}개`,
+          `뉴스끝 이후 예비 ${spareCount}건`,
+          `전체 표시 행 ${preview.items.length}개 (빈줄·섹션·뉴스끝 포함)`,
           ``,
+          `적용 시 템플릿에도 저장되어, 프로그램을 다시 열어도 이 큐시트가 유지됩니다.`,
           `현재 프로그램(${targetName ?? targetProgramId})에 적용할까요?`,
         ].join('\n'),
       )
       if (!ok) return
-      applyImportedRundown(parsed, targetProgramId)
+      applyImportedRundown(preview, targetProgramId)
     } finally {
       setPdfImportBusy(false)
     }
-  }
-
-  function exportRundown() {
-    if (!rundown) return
-    const filename = `rundown_${rundown.programId}_${rundown.broadcastDate || 'date'}_${uid('x_')}.json`
-    downloadJson(filename, rundown)
-  }
-
-  function exportTemplate() {
-    if (!rundown || !programId) return
-    const t = rundownToTemplate(rundown)
-    const now = new Date()
-    const ts = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}_${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}${String(now.getSeconds()).padStart(2, '0')}`
-    const safeName = (t.programName ?? t.programId).replace(/[\\/:*?"<>|]/g, '_')
-    const filename = `template_${safeName}_${ts}.json`
-    downloadJson(filename, t)
   }
 
   async function onImportJsonFile(file: File) {
@@ -865,17 +946,7 @@ function App() {
     setNewsStartDraft(clock)
     const now = Date.now()
     // Compute start index from the rundown itself to avoid stale derived lists.
-    const runnable: Array<Extract<RundownItem, { kind: 'newsItem' | 'sectionHeader' }>> = []
-    let afterEnd = false
-    for (const it of rundown.items) {
-      if (it.kind === 'marker' && it.title === '뉴스끝') {
-        afterEnd = true
-      }
-      if (afterEnd) continue
-      if ((it.kind === 'newsItem' || it.kind === 'sectionHeader') && it.includeInRun) {
-        runnable.push(it)
-      }
-    }
+    const runnable = includedRows.map((r) => r.item)
     let firstIdx = 0
     for (let i = 0; i < runnable.length; i += 1) {
       const dur = runnable[i]?.durationSeconds ?? 0
@@ -991,10 +1062,12 @@ function App() {
 
   function nextItemNow() {
     if (play.state === 'idle') return
+    itemEditedDuringPlayRef.current = false
     if (play.resumeAfterBack) {
       moveToIncludedIndex(play.resumeAfterBack.includedIndex, { commitDuration: false, resumeAfterBack: null })
       return
     }
+    if (play.currentIncludedIndex >= lastIncludedPlayIndex) return
     moveToIncludedIndex(play.currentIncludedIndex + 1, { commitDuration: true })
   }
 
@@ -1016,6 +1089,38 @@ function App() {
   startNewsNowRef.current = startNewsNow
   nextItemNowRef.current = nextItemNow
   togglePauseRef.current = togglePause
+  playStateRef.current = play.state
+
+  useEffect(() => {
+    if (play.state === 'idle') itemEditedDuringPlayRef.current = false
+  }, [play.state])
+
+  useEffect(() => {
+    const touch = (e: Event) => {
+      if (e instanceof KeyboardEvent && (e.code === 'Space' || e.key === ' ')) return
+      lastUserActivityAtMsRef.current = Date.now()
+    }
+    const events = ['mousedown', 'keydown', 'input', 'change', 'touchstart'] as const
+    for (const ev of events) window.addEventListener(ev, touch, { capture: true })
+    return () => {
+      for (const ev of events) window.removeEventListener(ev, touch, { capture: true })
+    }
+  }, [])
+
+  // 5초 무반응 시 선택·포커스를 현재 진행 아이템으로 되돌림
+  useEffect(() => {
+    if (play.state === 'idle') return
+    const tick = window.setInterval(() => {
+      if (playStateRef.current === 'idle') return
+      if (Date.now() - lastUserActivityAtMsRef.current < SPACE_ADVANCE_IDLE_MS) return
+      const playingId = currentPlayingIdRef.current
+      if (!playingId) return
+      setSelectedItemId((prev) => (prev === playingId ? prev : playingId))
+      const ae = document.activeElement
+      if (isEditableKeyboardTarget(ae) && ae instanceof HTMLElement) ae.blur()
+    }, 400)
+    return () => window.clearInterval(tick)
+  }, [play.state, play.currentIncludedIndex, includedRows.length])
 
   useEffect(() => {
     autoStartLatchRef.current = null
@@ -1038,8 +1143,31 @@ function App() {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.code !== 'Space' && e.key !== ' ') return
       if (e.repeat) return
+
+      const now = Date.now()
+      const idleMs = now - lastUserActivityAtMsRef.current
+      const atEndOfMain =
+        playStateRef.current !== 'idle' &&
+        includedRows.length > 0 &&
+        play.currentIncludedIndex >= lastIncludedPlayIndex
+      const forceNext =
+        playStateRef.current !== 'idle' &&
+        itemEditedDuringPlayRef.current &&
+        !atEndOfMain &&
+        idleMs >= SPACE_ADVANCE_IDLE_MS
+
+      if (forceNext) {
+        e.preventDefault()
+        if (document.activeElement instanceof HTMLElement) document.activeElement.blur()
+        itemEditedDuringPlayRef.current = false
+        lastUserActivityAtMsRef.current = now
+        nextItemNowRef.current()
+        return
+      }
+
       if (isEditableKeyboardTarget(e.target)) return
       e.preventDefault()
+      lastUserActivityAtMsRef.current = now
       if (play.state === 'idle') {
         startNewsNowRef.current()
       } else if (play.state === 'running') {
@@ -1050,7 +1178,7 @@ function App() {
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [rundown, play.state])
+  }, [rundown, play.state, play.currentIncludedIndex, lastIncludedPlayIndex, includedRows.length])
 
   // Auto-follow: must be declared before any conditional return
   const currentPlayingIdForFollow =
@@ -1260,15 +1388,6 @@ function App() {
           <button className="btn" onClick={saveCurrentAsTemplate} title="현재 큐시트를 템플릿으로 저장">
             템플릿 저장
           </button>
-          <button
-            className="btn"
-            onClick={() => {
-              if (confirm('템플릿을 내보낼까요? (취소를 누르면 큐시트를 내보냅니다)')) exportTemplate()
-              else exportRundown()
-            }}
-          >
-            내보내기
-          </button>
         </div>
       </div>
 
@@ -1302,8 +1421,6 @@ function App() {
               const effectiveNowForItem = play.state === 'paused' ? play.pausedAtMs ?? nowMs : nowMs
               const currentItemElapsedSeconds = rawItemElapsedSeconds(play, effectiveNowForItem)
 
-              const timeAdjustItemId =
-                rundown.items.find((x) => x.kind === 'newsItem' && x.isTimeAdjust)?.id ?? null
               const plannedEndTime = computed.plannedEndTime
               let projectedEndTime: string | null = null
               if (play.state !== 'idle' && includedRows.length > 0) {
@@ -1326,7 +1443,6 @@ function App() {
                 const start = row.startTime ?? null
                 const duration = it.kind === 'newsItem' || it.kind === 'sectionHeader' ? it.durationSeconds : 0
                 const isCurrent = currentPlayingId != null && it.id === currentPlayingId
-                const isTimeAdjust = it.kind === 'newsItem' && it.isTimeAdjust
                 const isLocked = isItemLockedDuringPlay(it.id, play, includedRows)
                 let displayRemainingSeconds: number | null = null
                 let displayRemainingTitle: string | undefined
@@ -1345,15 +1461,23 @@ function App() {
                     }
                   }
                 }
-                const showDurationEditor =
-                  (it.kind === 'newsItem' || it.kind === 'sectionHeader') &&
-                  (timeAdjustItemId == null || it.id === timeAdjustItemId)
+                const showDurationEditor = it.kind === 'newsItem' || it.kind === 'sectionHeader'
                 const emphasis = it.kind === 'newsItem' ? it.isEmphasis : false
                 const selected = selectedItemId != null && it.id === selectedItemId
 
-                const showNumber =
-                  it.kind === 'newsItem' && (it.category === '완제' || it.category === '단신') && it.title.trim() !== ''
-                if (showNumber) displayNo += 1
+                const orderLabel = (() => {
+                  if (it.kind === 'newsItem') {
+                    if (it.cueNo != null) return String(it.cueNo).padStart(2, '0')
+                    if (isArticleCategory(it.category) && it.title.trim() !== '') {
+                      displayNo += 1
+                      return String(displayNo).padStart(2, '0')
+                    }
+                    return ''
+                  }
+                  if (it.kind === 'sectionHeader') return '§'
+                  if (it.kind === 'blank') return '···'
+                  return ''
+                })()
 
                 return (
                   <div
@@ -1366,35 +1490,59 @@ function App() {
                       isAfterEnd ? 'afterEnd' : '',
                       isCurrent ? 'current' : '',
                       emphasis ? 'emphasis' : '',
-                      isTimeAdjust ? 'timeAdjust' : '',
                       selected ? 'selected' : '',
                       isLocked ? 'locked' : '',
                     ].join(' ')}
                     onMouseDown={() => setSelectedItemId(it.id)}
                   >
-                    <div className="mono">{showNumber ? String(displayNo).padStart(2, '0') : ''}</div>
+                    <div className="mono orderCell" title={it.kind === 'newsItem' && it.cueNo != null ? `PDF ${it.cueNo}번` : undefined}>
+                      {orderLabel}
+                    </div>
                     <div>
                       {it.kind === 'newsItem' ? (
                         <select
-                          className="select"
+                          className={['select', isBlankSlotCategory(it.category) ? 'selectBlankCategory' : '']
+                            .filter(Boolean)
+                            .join(' ')}
                           value={it.category}
                           disabled={isLocked}
-                          title={isLocked ? '진행 완료 — 편집 불가' : undefined}
+                          title={
+                            isLocked
+                              ? '진행 완료 — 편집 불가'
+                              : isBlankSlotCategory(it.category)
+                                ? '구분 없음 · 시간만 입력'
+                                : undefined
+                          }
                           onChange={(e) => {
                             const v = e.target.value
                             setRundownSafe((prev) => ({
                               ...prev,
                               items: prev.items.map((x) =>
                                 x.id === it.id && x.kind === 'newsItem'
-                                  ? { ...x, category: v, durationSeconds: defaultDurationForCategory(v) }
+                                  ? {
+                                      ...x,
+                                      category: v,
+                                      ...(v === CATEGORY_BLANK
+                                        ? {
+                                            title: '',
+                                            durationSeconds: defaultDurationForBlankSlot({
+                                              notes: x.notes,
+                                              reporter: x.reporter,
+                                            }),
+                                            includeInRun: true,
+                                          }
+                                        : { durationSeconds: defaultDurationForCategory(v) }),
+                                    }
                                   : x,
                               ),
                             }))
                           }}
                         >
-                          <option value="완제">완제</option>
-                          <option value="단신">단신</option>
-                          <option value=""></option>
+                          {CUE_CATEGORIES.map((c) => (
+                            <option key={c} value={c}>
+                              {categoryLabelForUi(c) || '\u00a0'}
+                            </option>
+                          ))}
                         </select>
                       ) : (
                         <span className="muted">{it.kind === 'marker' ? it.title : ''}</span>
@@ -1493,7 +1641,7 @@ function App() {
                           </span>
                         </div>
                       ) : (
-                        <span className="muted">{it.kind === 'blank' ? '' : it.title}</span>
+                        <span className="muted blankLabel">{it.kind === 'blank' ? '빈줄' : it.title}</span>
                       )}
                     </div>
 
@@ -1552,25 +1700,6 @@ function App() {
                                   items: prev.items.map((x) =>
                                     x.id === it.id && x.kind === 'newsItem' ? { ...x, isEmphasis: checked } : x,
                                   ),
-                                }))
-                              }}
-                            />
-                          </label>
-                        ) : null}
-                        {it.kind === 'newsItem' ? (
-                          <label className="emChk" title="시간조절(편성 맞추기, 1개만)">
-                            <input
-                              type="checkbox"
-                              checked={it.isTimeAdjust}
-                              disabled={isLocked}
-                              onChange={(e) => {
-                                const checked = e.target.checked
-                                setRundownSafe((prev) => ({
-                                  ...prev,
-                                  items: prev.items.map((x) => {
-                                    if (x.kind !== 'newsItem') return x
-                                    return { ...x, isTimeAdjust: x.id === it.id ? checked : false }
-                                  }),
                                 }))
                               }}
                             />
@@ -1667,16 +1796,30 @@ function App() {
                   <div
                     ref={tableScrollRef}
                     className="tableScroll"
-                    style={{ paddingBottom: pinnedFooterHeight ? pinnedFooterHeight + 16 : undefined }}
+                    style={{
+                      paddingBottom: pinnedFooterHeight
+                        ? pinnedFooterHeight + 48
+                        : 120,
+                    }}
                     onScroll={() => {
                       // follow toggle removed; keep behavior unchanged (no-op)
                     }}
                   >
                     {beforeEnd.map(renderRow)}
                     {endRow ? renderRow(endRow) : null}
+                    {afterEnd.length > 0 ? (
+                      <div className="tr cueDivider afterEndDivider" aria-hidden>
+                        <div className="cueDividerLabel">뉴스끝 이후 · PDF 예비·서버 ({afterEnd.length}행)</div>
+                      </div>
+                    ) : null}
                     {afterEnd.map(renderRow)}
 
-                    <div ref={pinnedFooterRef} className="footerBar pinnedFooter pinnedFooterFixed">
+                    <div
+                      ref={pinnedFooterRef}
+                      className={['footerBar', 'pinnedFooter', 'pinnedFooterFixed', timingDraftDirty ? 'pinnedFooterDirty' : '']
+                        .filter(Boolean)
+                        .join(' ')}
+                    >
                       <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
                         <button
                           className="btn"
@@ -1764,31 +1907,33 @@ function App() {
                           빈줄
                         </button>
                         <button
-                          className="btn subtle"
-                          title="오프닝·섹션·뉴스끝 앞뒤 등에 구분용 빈줄 자동 삽입"
+                          className="btn subtle blankSlotBtn"
+                          title="앵커 교체·특이사항 — 구분·제목 없음, 앵커 기본 10초"
+                          aria-label="구분 없는 행 추가"
                           onClick={() => {
+                            const slot: RundownItem = {
+                              id: uid('i_'),
+                              kind: 'newsItem',
+                              category: CATEGORY_BLANK,
+                              reporter: '',
+                              title: '',
+                              durationSeconds: defaultDurationForBlankSlot({ notes: '앵커', reporter: '' }),
+                              notes: '앵커',
+                              isDefaultItem: false,
+                              isEmphasis: false,
+                              isTimeAdjust: false,
+                              includeInRun: true,
+                              flags: [],
+                            }
                             setRundownSafe((prev) => ({
                               ...prev,
-                              items: insertVisualBlankSeparators(prev.items),
+                              items: insertAfterSelectedOrBeforeEnd(prev.items, selectedItemId, slot),
                             }))
+                            setSelectedItemId(slot.id)
+                            setFocusItemId(slot.id)
                           }}
                         >
-                          구분 빈줄
-                        </button>
-                        <button
-                          className="btn subtle"
-                          onClick={() => {
-                            const header: RundownItem = {
-                              id: uid('s_'),
-                              kind: 'sectionHeader',
-                              title: '섹션',
-                              durationSeconds: 0,
-                              includeInRun: true,
-                            }
-                            setRundownSafe((prev) => ({ ...prev, items: insertBeforeMarkerEnd(prev.items, header) }))
-                          }}
-                        >
-                          섹션 헤더
+                          ''
                         </button>
                       </div>
 
@@ -1846,12 +1991,11 @@ function App() {
                             onFocus={(e) => {
                               e.currentTarget.select()
                             }}
-                            onBlur={() => {
-                              const v = newsStartDraft
-                              setRundownSafe((prev) => ({
-                                ...prev,
-                                timing: { ...prev.timing, newsStartTime: v },
-                              }))
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') {
+                                e.preventDefault()
+                                applyTimingEdits()
+                              }
                             }}
                           />
                         </label>
@@ -1885,21 +2029,11 @@ function App() {
                             onFocus={(e) => {
                               e.currentTarget.select()
                             }}
-                            onBlur={() => {
-                              if (isEndClockBudget) return
-                              const secs = parseTimeToSeconds(scheduledDraft)
-                              if (secs == null) {
-                                setScheduledDraft(formatSeconds(rundown.timing.scheduledSeconds))
-                                return
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') {
+                                e.preventDefault()
+                                applyTimingEdits()
                               }
-                              setRundownSafe((prev) => ({
-                                ...prev,
-                                timing: {
-                                  ...prev.timing,
-                                  scheduledSeconds: secs,
-                                  newsEndTime: defaultNewsEndTime(prev.timing.newsStartTime, secs),
-                                },
-                              }))
                             }}
                           />
                         </label>
@@ -1916,16 +2050,23 @@ function App() {
                             onFocus={(e) => {
                               e.currentTarget.select()
                             }}
-                            onBlur={() => {
-                              if (!isEndClockBudget) return
-                              const v = newsEndDraft.trim()
-                              setRundownSafe((prev) => ({
-                                ...prev,
-                                timing: { ...prev.timing, newsEndTime: v },
-                              }))
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') {
+                                e.preventDefault()
+                                applyTimingEdits()
+                              }
                             }}
                           />
                         </label>
+                        <button
+                          type="button"
+                          className="btn timingApplyBtn"
+                          disabled={!timingDraftDirty}
+                          onClick={applyTimingEdits}
+                          title="시작·편성·뉴스끝 시각을 큐시트에 반영"
+                        >
+                          적용
+                        </button>
                       </div>
                     </div>
                   </div>

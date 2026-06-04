@@ -1,10 +1,14 @@
 import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist/legacy/build/pdf.mjs'
-import pdfWorkerSrc from 'pdfjs-dist/legacy/build/pdf.worker.min.mjs?url'
 
-GlobalWorkerOptions.workerSrc = pdfWorkerSrc
+async function ensurePdfWorker(): Promise<void> {
+  if (GlobalWorkerOptions.workerSrc) return
+  const mod = await import('pdfjs-dist/legacy/build/pdf.worker.min.mjs?url')
+  GlobalWorkerOptions.workerSrc = (mod as { default: string }).default
+}
 
 /** PDF 각 페이지에서 추출한 비어 있지 않은 텍스트 토큰 */
 export async function extractPdfPageTokens(file: File): Promise<string[][]> {
+  await ensurePdfWorker()
   const data = new Uint8Array(await file.arrayBuffer())
   const pdf = await getDocument({ data, useSystemFonts: true }).promise
   const pages: string[][] = []

@@ -261,8 +261,39 @@
 .tr.selected:hover {
   background: rgba(96, 165, 250, 0.1);
 }
+.tr.current.selected {
+  outline: 2px solid rgba(96, 165, 250, 0.45);
+  background: rgba(96, 165, 250, 0.12);
+}
+.tr.current.selected:hover {
+  background: rgba(96, 165, 250, 0.14);
+}
 .tr.afterEnd {
-  opacity: 0.65;
+  opacity: 0.92;
+  background: rgba(96, 165, 250, 0.04);
+}
+.tr.afterEndDivider,
+.tr.cueDivider {
+  display: block;
+  padding: 10px 12px;
+  border-top: 1px dashed rgba(96, 165, 250, 0.45);
+  border-bottom: 1px dashed rgba(96, 165, 250, 0.25);
+  background: rgba(96, 165, 250, 0.06);
+}
+.cueDividerLabel {
+  font-size: 12px;
+  font-weight: 650;
+  color: var(--blue);
+  text-align: center;
+  width: 100%;
+}
+.tr.blank .blankLabel {
+  font-size: 12px;
+  color: var(--muted);
+  font-style: italic;
+}
+.orderCell {
+  font-weight: 650;
 }
 .tr.current {
   outline: 2px solid rgba(16, 185, 129, 0.35);
@@ -420,10 +451,10 @@
 }
 
 .pinnedFooter {
-  background: rgba(20, 24, 33, 0.92);
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
-  border-top: 1px solid var(--border);
+  background: linear-gradient(180deg, rgba(30, 38, 52, 0.96), rgba(24, 30, 42, 0.98));
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border-top: 1px solid rgba(71, 85, 105, 0.45);
 }
 
 .pinnedFooterFixed {
@@ -473,7 +504,7 @@
 }
 
 .pinnedFooter {
-  box-shadow: 0 -12px 28px rgba(0, 0, 0, 0.35);
+  box-shadow: 0 -10px 32px rgba(0, 0, 0, 0.38);
 }
 
 .pinnedFooter::before {
@@ -483,7 +514,32 @@
   right: 0;
   top: 0;
   height: 1px;
-  background: linear-gradient(90deg, transparent, rgba(96, 165, 250, 0.35), transparent);
+  background: linear-gradient(90deg, transparent, rgba(100, 116, 139, 0.5), transparent);
+}
+
+.pinnedFooterDirty {
+  border-top-color: rgba(96, 165, 250, 0.35);
+}
+
+.pinnedFooterDirty::before {
+  background: linear-gradient(90deg, transparent, rgba(96, 165, 250, 0.45), transparent);
+}
+
+.btn.timingApplyBtn {
+  align-self: flex-end;
+  min-height: 40px;
+  padding: 0 16px;
+  font-weight: 750;
+}
+
+.btn.timingApplyBtn:not(:disabled) {
+  background: rgba(96, 165, 250, 0.16);
+  border-color: rgba(96, 165, 250, 0.42);
+  color: var(--text-h);
+}
+
+.btn.timingApplyBtn:not(:disabled):hover {
+  background: rgba(96, 165, 250, 0.24);
 }
 
 .row {
@@ -789,6 +845,26 @@
   color: var(--muted);
   background: rgba(148, 163, 184, 0.1);
 }
+.badge.categoryBadge {
+  border-color: rgba(148, 163, 184, 0.45);
+  color: var(--text-h);
+  background: rgba(148, 163, 184, 0.12);
+  font-weight: 650;
+}
+.selectBlankCategory {
+  color: var(--muted);
+  min-width: 2.5em;
+}
+
+.btn.blankSlotBtn {
+  min-width: 2.5rem;
+  letter-spacing: 0;
+  color: var(--muted);
+}
+
+.tr.newsItem:has(.categoryBadge) .select {
+  font-weight: 650;
+}
 
 @media (prefers-reduced-motion: no-preference) {
   .programBtn,
@@ -875,10 +951,13 @@
   .tr > :nth-child(1) {
     grid-column: 1 / 2;
   }
-  .tr > :nth-child(2),
   .tr > :nth-child(3),
   .tr > :nth-child(7) {
     display: none;
+  }
+  .tr > :nth-child(2) .select {
+    font-size: 11px;
+    padding: 4px 6px;
   }
   .tr > :nth-child(4) {
     grid-column: 2 / 3;
