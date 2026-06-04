@@ -1,3 +1,14 @@
+export type ArticleScript = {
+  anchorText: string
+  bodyText: string
+  anchorIncluded: boolean
+  bodyIncluded: boolean
+  /** 최초 측정 합계(초). 편집 후 절감량 비교용 */
+  baselineSeconds: number
+  /** 사용자가 지정한 큐시트 반영 길이(초). 없으면 자동 측정값 사용 */
+  preferredDurationSeconds?: number | null
+}
+
 export type TemplateItem =
   | {
       id: string
@@ -12,6 +23,7 @@ export type TemplateItem =
       isTimeAdjust: boolean
       includeInRun: boolean
       flags: string[]
+      article?: ArticleScript
     }
   | { id: string; kind: 'blank'; title: string; includeInRun: false }
   | { id: string; kind: 'sectionHeader'; title: string; durationSeconds: number; includeInRun: boolean }
@@ -45,6 +57,7 @@ export type RundownItem =
       isTimeAdjust: boolean
       includeInRun: boolean
       flags: string[]
+      article?: ArticleScript
     }
   | { id: string; kind: 'blank'; title: string; includeInRun: false }
   | { id: string; kind: 'sectionHeader'; title: string; durationSeconds: number; includeInRun: boolean }

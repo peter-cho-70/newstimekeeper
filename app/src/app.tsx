@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import './app.css'
-import type { BudgetMode, Rundown, RundownItem, Template } from './domain/types'
+import type { ArticleScript, BudgetMode, Rundown, RundownItem, Template } from './domain/types'
+import { ArticleEditorModal } from './components/ArticleEditorModal'
 import {
   addSecondsToClock,
   computeBudgetSeconds,
@@ -11,6 +12,9 @@ import {
 } from './domain/time'
 import { NEWS_ECONOMY_TEMPLATE, NEWS_EXTRA_TEMPLATE } from './templates'
 import { downloadJson, readJsonFile } from './domain/file'
+import { parsePdfToRundown } from './domain/pdfRundownParser'
+import { applyActualDurationsFromPlay, hasPlaybackDurationData } from './domain/playbackApply'
+import { insertVisualBlankSeparators } from './domain/rundownLayout'
 import { uid } from './domain/uid'
 
 type ProgramId = string
@@ -37,6 +41,20 @@ const DEFAULT_DURATION_BY_CATEGORY: Record<string, number> = {
 
 function defaultDurationForCategory(category: string): number {
   return DEFAULT_DURATION_BY_CATEGORY[category] ?? 90
+}
+
+function isArticleNewsItem(it: RundownItem): it is RundownItem & { kind: 'newsItem' } {
+  return it.kind === 'newsItem' && (it.category === '완제' || it.category === '단신')
+}
+
+function guessProgramIdFromPdfName(filename: string): ProgramId {
+  if (/12|12시/i.test(filename)) return 'news_12'
+  if (/930/i.test(filename)) return 'news_930'
+  if (/25/i.test(filename)) return 'news_25'
+  if (/데스크/i.test(filename)) return 'news_desk'
+  if (/외전/i.test(filename)) return 'news_extra'
+  if (/경제/i.test(filename)) return 'news_economy'
+  return 'news_12'
 }
 
 const STORAGE_KEY_PREFIX = 'newstimekeeper:rundown:v1:'
@@ -305,7 +323,9 @@ function App() {
   const [programId, setProgramId] = useState<ProgramId | null>(null)
   const [rundown, setRundown] = useState<Rundown | null>(null)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
+  const pdfFileInputRef = useRef<HTMLInputElement | null>(null)
   const templatesFileInputRef = useRef<HTMLInputElement | null>(null)
+  const [pdfImportBusy, setPdfImportBusy] = useState(false)
   const [focusItemId, setFocusItemId] = useState<string | null>(null)
   const [selectedItemId, setSelectedItemId] = useState<string | null>(null)
   const pinnedFooterRef = useRef<HTMLDivElement | null>(null)
@@ -333,6 +353,7 @@ function App() {
     }
   })
   const [newProgramNameDraft, setNewProgramNameDraft] = useState<string>('')
+  const [articleEditorItemId, setArticleEditorItemId] = useState<string | null>(null)
 
   function persistCustomPrograms(nextPrograms: ProgramDef[]) {
     const custom = nextPrograms.filter((p) => !p.builtIn).map((p) => ({ id: p.id, name: p.name }))
@@ -538,7 +559,7 @@ function App() {
           const leaving = includedRows[idx]?.item
           const nextElapsedByItemIdMs =
             leaving && leaving.id
-              ? { ...prev.elapsedByItemIdMs, [leaving.id]: Math.max(0, dur * 1000) }
+              ? { ...prev.elapsedByItemIdMs, [leaving.id]: Math.max(0, elapsedMs) }
               : prev.elapsedByItemIdMs
           const nextIdx = idx + 1
           if (nextIdx >= includedRows.length) {
@@ -669,17 +690,72 @@ function App() {
     setSelectedItemId(null)
   }
 
+  function applyImportedRundown(parsed: Rundown, targetProgramId: ProgramId) {
+    const pName = programs.find((p) => p.id === targetProgramId)?.name ?? parsed.programName
+    const merged: Rundown = {
+      ...parsed,
+      programId: targetProgramId,
+      programName: pName,
+    }
+    const normalized = normalizeRundown(merged)
+    setProgramId(targetProgramId)
+    setRundown(normalized)
+    localStorage.setItem(storageKeyForRundown(targetProgramId), JSON.stringify(normalized))
+    setPlay(idlePlaySession())
+    setSelectedItemId(null)
+  }
+
   async function onImportRundownFile(file: File) {
     const parsed = await readJsonFile<Rundown>(file)
     if (parsed.type !== 'rundown') {
       throw new Error('이 파일은 큐시트(rundown) 형식이 아닙니다.')
     }
-    setProgramId(parsed.programId as ProgramId)
-    const normalized = normalizeRundown(parsed)
-    setRundown(normalized)
-    localStorage.setItem(storageKeyForRundown(parsed.programId as ProgramId), JSON.stringify(normalized))
-    setPlay(idlePlaySession())
-    setSelectedItemId(null)
+    applyImportedRundown(parsed, parsed.programId as ProgramId)
+  }
+
+  async function onImportPdfFile(file: File) {
+    const isPdf =
+      file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')
+    if (!isPdf) {
+      throw new Error('PDF 큐시트 파일만 불러올 수 있습니다.')
+    }
+
+    const targetProgramId = (programId ?? guessProgramIdFromPdfName(file.name)) as ProgramId
+    const targetName = programs.find((p) => p.id === targetProgramId)?.name
+
+    setPdfImportBusy(true)
+    try {
+      const parsed = await parsePdfToRundown(file, {
+        programId: targetProgramId,
+        programName: targetName,
+      })
+      const preview = normalizeRundown({
+        ...parsed,
+        programId: targetProgramId,
+        programName: targetName ?? parsed.programName,
+      })
+      const { includedTotalSeconds, deltaSeconds, budgetSeconds } = computeRundown(preview)
+      const newsCount = preview.items.filter(
+        (it) => it.kind === 'newsItem' && (it.category === '완제' || it.category === '단신'),
+      ).length
+      const ok = confirm(
+        [
+          `PDF 큐시트를 읽었습니다.`,
+          ``,
+          `파일: ${file.name}`,
+          `방송일: ${preview.broadcastDate}`,
+          `편성: ${formatSeconds(budgetSeconds)} · 본편 합계: ${formatSeconds(includedTotalSeconds)}`,
+          `편성대비: ${formatDelta(deltaSeconds)}`,
+          `기사/단신 약 ${newsCount}건 · 전체 행 ${preview.items.length}개`,
+          ``,
+          `현재 프로그램(${targetName ?? targetProgramId})에 적용할까요?`,
+        ].join('\n'),
+      )
+      if (!ok) return
+      applyImportedRundown(parsed, targetProgramId)
+    } finally {
+      setPdfImportBusy(false)
+    }
   }
 
   function exportRundown() {
@@ -748,11 +824,30 @@ function App() {
     throw new Error('지원하지 않는 파일 형식입니다. (rundown/template JSON만 가능)')
   }
 
+  function persistRundownAndTemplate(rd: Rundown, pId: ProgramId) {
+    localStorage.setItem(storageKeyForRundown(pId), JSON.stringify(rd))
+    localStorage.setItem(storageKeyForTemplate(pId), JSON.stringify(rundownToTemplate(rd)))
+  }
+
   function saveCurrentAsTemplate() {
     if (!rundown || !programId) return
-    const t = rundownToTemplate(rundown)
-    localStorage.setItem(storageKeyForTemplate(programId), JSON.stringify(t))
+    persistRundownAndTemplate(rundown, programId)
     alert('이 큐시트를 템플릿으로 저장했습니다. 다음에 프로그램을 열면 자동으로 이 템플릿이 열립니다.')
+  }
+
+  function exitToProgramSelect() {
+    if (rundown && programId) {
+      let rd = rundown
+      if (hasPlaybackDurationData(play)) {
+        const includedIds = includedRows.map((r) => r.item.id)
+        rd = applyActualDurationsFromPlay(rundown, play, includedIds)
+      }
+      persistRundownAndTemplate(rd, programId)
+    }
+    setProgramId(null)
+    setRundown(null)
+    setSelectedItemId(null)
+    setPlay(idlePlaySession())
   }
 
   function loadLastRundownSession(pId: ProgramId) {
@@ -1157,13 +1252,8 @@ function App() {
           </span>
           <button
             className="btn subtle"
-            onClick={() => {
-              setProgramId(null)
-              setRundown(null)
-              setSelectedItemId(null)
-              setPlay(idlePlaySession())
-            }}
-            title="프로그램 선택 화면으로 나가기"
+            onClick={exitToProgramSelect}
+            title="실제 진행 시간을 반영해 템플릿으로 저장한 뒤 프로그램 선택 화면으로 이동"
           >
             뉴스나가기
           </button>
@@ -1178,16 +1268,6 @@ function App() {
             }}
           >
             내보내기
-          </button>
-          <button
-            className="btn"
-            onClick={() => {
-              if (!fileInputRef.current) return
-              fileInputRef.current.value = ''
-              fileInputRef.current.click()
-            }}
-          >
-            불러오기
           </button>
         </div>
       </div>
@@ -1219,8 +1299,6 @@ function App() {
               const beforeEnd = endIdx >= 0 ? rows.slice(0, endIdx) : rows
               const endRow = endIdx >= 0 ? rows[endIdx] : null
               const afterEnd = endIdx >= 0 ? rows.slice(endIdx + 1) : []
-              const afterEndSlots = afterEnd.slice(0, 2)
-
               const effectiveNowForItem = play.state === 'paused' ? play.pausedAtMs ?? nowMs : nowMs
               const currentItemElapsedSeconds = rawItemElapsedSeconds(play, effectiveNowForItem)
 
@@ -1363,7 +1441,31 @@ function App() {
                             }}
                           />
                           {it.isDefaultItem ? <span className="badge">기본</span> : null}
-                          {!it.includeInRun || isAfterEnd ? <span className="badge off">제외</span> : null}
+                          {isAfterEnd && it.kind === 'newsItem' && it.includeInRun ? (
+                            <span className="badge reserve">예비</span>
+                          ) : !it.includeInRun ? (
+                            <span className="badge off">제외</span>
+                          ) : null}
+                          {isArticleNewsItem(it) ? (
+                            <button
+                              type="button"
+                              className={`miniBtn articleOpenBtn ${it.article ? 'hasArticle' : ''}`}
+                              disabled={isLocked}
+                              title={
+                                isLocked
+                                  ? '진행 완료 — 편집 불가'
+                                  : it.article
+                                    ? '기사·길이 편집 (입력됨)'
+                                    : '기사 입력 · 길이 측정'
+                              }
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                setArticleEditorItemId(it.id)
+                              }}
+                            >
+                              기사
+                            </button>
+                          ) : null}
                           <span className="durPill mono" title="길이(mm:ss)">
                             {formatSeconds(duration)}
                           </span>
@@ -1572,25 +1674,23 @@ function App() {
                   >
                     {beforeEnd.map(renderRow)}
                     {endRow ? renderRow(endRow) : null}
-                    {Array.from({ length: 2 }).map((_, i) => {
-                      const row = afterEndSlots[i] ?? null
-                      if (row) return renderRow(row)
-                      return (
-                        <div key={`pinned-spacer-${i}`} className="tr pinnedSpacerRow afterEnd">
-                          <div className="mono"></div>
-                          <div></div>
-                          <div></div>
-                          <div className="titleCell"></div>
-                          <div className="right mono"></div>
-                          <div></div>
-                          <div className="right"></div>
-                        </div>
-                      )
-                    })}
-                    {afterEnd.length > 2 ? <div className="pinnedMore muted">… 뉴스끝 아래 {afterEnd.length - 2}개 더 있음</div> : null}
+                    {afterEnd.map(renderRow)}
 
                     <div ref={pinnedFooterRef} className="footerBar pinnedFooter pinnedFooterFixed">
                       <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
+                        <button
+                          className="btn"
+                          disabled={pdfImportBusy}
+                          onClick={() => {
+                            if (!pdfFileInputRef.current) return
+                            pdfFileInputRef.current.value = ''
+                            pdfFileInputRef.current.click()
+                          }}
+                          title="MBC 뉴스 큐시트 PDF 불러오기"
+                        >
+                          {pdfImportBusy ? 'PDF 분석 중…' : '큐시트 불러오기 (PDF)'}
+                        </button>
+                        <span className="hint footerPdfHint">MBC 뉴스 큐시트 PDF · 적용 전 요약 확인</span>
                         <button
                           className="btn subtle"
                           disabled={!selectedItemId || isSelectedItemLocked}
@@ -1662,6 +1762,18 @@ function App() {
                           }}
                         >
                           빈줄
+                        </button>
+                        <button
+                          className="btn subtle"
+                          title="오프닝·섹션·뉴스끝 앞뒤 등에 구분용 빈줄 자동 삽입"
+                          onClick={() => {
+                            setRundownSafe((prev) => ({
+                              ...prev,
+                              items: insertVisualBlankSeparators(prev.items),
+                            }))
+                          }}
+                        >
+                          구분 빈줄
                         </button>
                         <button
                           className="btn subtle"
@@ -1825,20 +1937,46 @@ function App() {
       </div>
 
       <input
-        ref={fileInputRef}
+        ref={pdfFileInputRef}
         type="file"
-        accept="application/json"
+        accept="application/pdf,.pdf"
         style={{ display: 'none' }}
         onChange={async (e) => {
           const f = e.currentTarget.files?.[0]
           if (!f) return
           try {
-            await onImportJsonFile(f)
+            await onImportPdfFile(f)
           } catch (err) {
-            alert(err instanceof Error ? err.message : '불러오기에 실패했습니다.')
+            alert(err instanceof Error ? err.message : 'PDF 불러오기에 실패했습니다.')
           }
         }}
       />
+
+      {articleEditorItemId && rundown
+        ? (() => {
+            const editItem = rundown.items.find((x) => x.id === articleEditorItemId)
+            if (!editItem || !isArticleNewsItem(editItem)) return null
+            const locked = isItemLockedDuringPlay(editItem.id, play, includedRows)
+            return (
+              <ArticleEditorModal
+                itemTitle={editItem.title}
+                initial={editItem.article}
+                disabled={locked}
+                onClose={() => setArticleEditorItemId(null)}
+                onApply={(article: ArticleScript, durationSeconds: number) => {
+                  setRundownSafe((prev) => ({
+                    ...prev,
+                    items: prev.items.map((x) =>
+                      x.id === editItem.id && x.kind === 'newsItem'
+                        ? { ...x, article, durationSeconds: Math.max(0, durationSeconds) }
+                        : x,
+                    ),
+                  }))
+                }}
+              />
+            )
+          })()
+        : null}
     </div>
   )
 }
