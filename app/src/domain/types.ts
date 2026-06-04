@@ -9,6 +9,7 @@ export type TemplateItem =
       notes: string
       isDefaultItem: boolean
       isEmphasis: boolean
+      isTimeAdjust: boolean
       includeInRun: boolean
       flags: string[]
     }
@@ -41,12 +42,15 @@ export type RundownItem =
       notes: string
       isDefaultItem: boolean
       isEmphasis: boolean
+      isTimeAdjust: boolean
       includeInRun: boolean
       flags: string[]
     }
   | { id: string; kind: 'blank'; title: string; includeInRun: false }
   | { id: string; kind: 'sectionHeader'; title: string; durationSeconds: number; includeInRun: boolean }
   | { id: string; kind: 'marker'; title: string; includeInRun: false }
+
+export type BudgetMode = 'scheduled' | 'endClock'
 
 export type Rundown = {
   schemaVersion: string
@@ -60,6 +64,11 @@ export type Rundown = {
   timing: {
     newsStartTime: string
     scheduledSeconds: number
+    /** HH:MM:SS — used when budgetMode is endClock */
+    newsEndTime: string
+    budgetMode: BudgetMode
+    /** When true (default), start playback automatically at newsStartTime. */
+    autoStartAtNewsTime: boolean
     toleranceSeconds: number
   }
   items: RundownItem[]

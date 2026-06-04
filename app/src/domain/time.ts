@@ -32,7 +32,16 @@ export function parseTimeToSeconds(input: string): number | null {
   return null
 }
 
-function addSecondsToClock(clockHHMMSS: string, secondsToAdd: number): string {
+export function parseClock(clockHHMMSS: string): { hh: number; mm: number; ss: number } | null {
+  const parts = clockHHMMSS.trim().split(':')
+  if (parts.length !== 3) return null
+  if (parts.some((p) => p === '' || !/^\d+$/.test(p))) return null
+  const [hh, mm, ss] = parts.map((x) => parseInt(x, 10))
+  if (hh > 23 || mm > 59 || ss > 59) return null
+  return { hh, mm, ss }
+}
+
+export function addSecondsToClock(clockHHMMSS: string, secondsToAdd: number): string {
   const parsed = parseClock(clockHHMMSS)
   if (!parsed) return ''
   const total = parsed.hh * 3600 + parsed.mm * 60 + parsed.ss + secondsToAdd
@@ -43,13 +52,24 @@ function addSecondsToClock(clockHHMMSS: string, secondsToAdd: number): string {
   return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}`
 }
 
-function parseClock(clockHHMMSS: string): { hh: number; mm: number; ss: number } | null {
-  const parts = clockHHMMSS.trim().split(':')
-  if (parts.length !== 3) return null
-  if (parts.some((p) => p === '' || !/^\d+$/.test(p))) return null
-  const [hh, mm, ss] = parts.map((x) => parseInt(x, 10))
-  if (hh > 23 || mm > 59 || ss > 59) return null
-  return { hh, mm, ss }
+/** Seconds from start clock to end clock (end may be next calendar day). */
+export function secondsBetweenClocks(startHHMMSS: string, endHHMMSS: string): number | null {
+  const start = parseClock(startHHMMSS)
+  const end = parseClock(endHHMMSS)
+  if (!start || !end) return null
+  const startSec = start.hh * 3600 + start.mm * 60 + start.ss
+  const endSec = end.hh * 3600 + end.mm * 60 + end.ss
+  let diff = endSec - startSec
+  if (diff < 0) diff += 86400
+  return diff
+}
+
+export function computeBudgetSeconds(timing: Rundown['timing']): number {
+  if (timing.budgetMode === 'endClock') {
+    const fromEnd = secondsBetweenClocks(timing.newsStartTime, timing.newsEndTime)
+    if (fromEnd != null) return fromEnd
+  }
+  return timing.scheduledSeconds
 }
 
 export type ComputedRow = {
@@ -63,26 +83,23 @@ export function computeRundown(rundown: Rundown): {
   rows: ComputedRow[]
   includedTotalSeconds: number
   deltaSeconds: number
+  budgetSeconds: number
+  plannedEndTime: string
 } {
   const rows: ComputedRow[] = []
 
   let afterEnd = false
   let runningIncludedSeconds = 0
   let includedTotalSeconds = 0
-  let includedNewsItemSeconds = 0
 
   const isRunnable = (it: RundownItem) => it.kind === 'newsItem' || it.kind === 'sectionHeader'
 
-  // First pass compute included total seconds
   for (const it of rundown.items) {
     if (it.kind === 'marker' && it.title === '뉴스끝') afterEnd = true
     const included = !afterEnd && isRunnable(it) && it.includeInRun
     if (included) includedTotalSeconds += it.durationSeconds
-    const newsIncluded = !afterEnd && it.kind === 'newsItem' && it.includeInRun
-    if (newsIncluded) includedNewsItemSeconds += it.durationSeconds
   }
 
-  // Second pass compute per-row start times for included rows
   afterEnd = false
   for (const it of rundown.items) {
     const isMarkerEnd = it.kind === 'marker' && it.title === '뉴스끝'
@@ -94,11 +111,14 @@ export function computeRundown(rundown: Rundown): {
     if (isIncluded && isRunnable(it)) runningIncludedSeconds += it.durationSeconds
   }
 
+  const budgetSeconds = computeBudgetSeconds(rundown.timing)
+  const plannedEndTime = addSecondsToClock(rundown.timing.newsStartTime, includedTotalSeconds)
+
   return {
     rows,
     includedTotalSeconds,
-    // 편성대비 = 전체 아이템 합(뉴스아이템 + 섹션헤더, includeInRun=true, 뉴스끝 이전) - 편성시간
-    deltaSeconds: includedTotalSeconds - rundown.timing.scheduledSeconds,
+    budgetSeconds,
+    plannedEndTime,
+    deltaSeconds: includedTotalSeconds - budgetSeconds,
   }
 }
-

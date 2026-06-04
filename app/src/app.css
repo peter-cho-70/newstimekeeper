@@ -59,6 +59,25 @@
   font-size: 11px;
   color: var(--muted);
 }
+.metricLabelRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.autoStartCheck {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+}
+.autoStartCheck input {
+  margin: 0;
+  accent-color: var(--accent);
+}
 .metric .value {
   font-size: 22px;
   font-weight: 700;
@@ -71,7 +90,21 @@
 .metric .value.bad {
   color: var(--red);
 }
+.metric .value.remainingAlways {
+  color: var(--red);
+}
 
+.itemRemainingCell {
+  font-weight: 700;
+  font-size: 15px;
+  letter-spacing: 0.2px;
+}
+.itemRemainingCell.ok {
+  color: var(--green);
+}
+.itemRemainingCell.bad {
+  color: var(--red);
+}
 .mono {
   font-family: var(--mono);
   letter-spacing: 0.1px;
@@ -134,6 +167,22 @@
   background: rgba(32, 38, 54, 0.7);
 }
 
+.newsTotalTag {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.newsTotalTag .tagMain {
+  font-weight: 600;
+}
+.newsTotalTag .tagSub {
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--muted);
+  opacity: 0.92;
+}
+
 .table {
   width: 100%;
   display: flex;
@@ -142,7 +191,7 @@
 }
 .thead {
   display: grid;
-  grid-template-columns: 60px 110px 1fr 3fr 90px 1fr 320px;
+  grid-template-columns: 60px 110px 1fr 3fr 90px 96px 320px;
   gap: 10px;
   padding: 10px 12px;
   font-size: 12px;
@@ -153,7 +202,7 @@
 
 .tr {
   display: grid;
-  grid-template-columns: 60px 110px 1fr 3fr 90px 1fr 320px;
+  grid-template-columns: 60px 110px 1fr 3fr 90px 96px 320px;
   gap: 10px;
   padding: 8px 12px;
   border-bottom: 1px solid rgba(42, 49, 66, 0.9);
@@ -231,6 +280,16 @@
   font-size: inherit;
 }
 
+.tr.locked {
+  opacity: 0.72;
+}
+.tr.locked .input,
+.tr.locked .select,
+.tr.locked .miniBtn,
+.tr.locked .iconBtn {
+  cursor: not-allowed;
+}
+
 .tr.markerEnd {
   background: rgba(239, 68, 68, 0.08);
   border-top: 1px solid rgba(239, 68, 68, 0.35);
@@ -238,6 +297,34 @@
 }
 .tr.markerEnd:hover {
   background: rgba(239, 68, 68, 0.1);
+}
+
+.endTimeStack {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  line-height: 1.25;
+}
+.endTimeLine {
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--text-h);
+}
+.endTimeLine.projected {
+  color: var(--amber);
+  font-weight: 700;
+}
+.endTimeLine.target {
+  color: var(--blue);
+  font-size: 12px;
+  font-weight: 600;
+}
+.endTimeLabel {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--muted);
+  margin-right: 4px;
 }
 
 .right {
@@ -492,8 +579,14 @@
   display: none;
 }
 
+/* Emphasis rows: warm amber tint — readable on dark UI, distinct from current (green) */
 .tr.emphasis {
   font-size: calc(1em + 4px);
+  background: linear-gradient(90deg, rgba(245, 158, 11, 0.24), rgba(245, 158, 11, 0.1));
+  box-shadow: inset 3px 0 0 var(--amber);
+}
+.tr.emphasis:hover {
+  background: linear-gradient(90deg, rgba(245, 158, 11, 0.3), rgba(245, 158, 11, 0.14));
 }
 .tr.emphasis .input,
 .tr.emphasis .select,
@@ -501,6 +594,29 @@
   font-size: calc(1em + 4px);
   font-weight: 650;
   letter-spacing: 0.1px;
+  color: #fff4e0;
+  border-color: rgba(245, 158, 11, 0.45);
+  background: rgba(245, 158, 11, 0.12);
+}
+.tr.emphasis .durPill {
+  background: rgba(245, 158, 11, 0.2);
+  color: #ffe8c2;
+}
+.tr.emphasis.current {
+  background: linear-gradient(90deg, rgba(16, 185, 129, 0.2), rgba(245, 158, 11, 0.16));
+  box-shadow: inset 3px 0 0 var(--amber), inset 0 0 0 1px rgba(16, 185, 129, 0.35);
+}
+
+.tr.timeAdjust {
+  box-shadow: inset 3px 0 0 var(--blue);
+  background: rgba(96, 165, 250, 0.08);
+}
+.tr.timeAdjust:hover {
+  background: rgba(96, 165, 250, 0.12);
+}
+.tr.timeAdjust.current {
+  background: linear-gradient(90deg, rgba(16, 185, 129, 0.18), rgba(96, 165, 250, 0.12));
+  box-shadow: inset 3px 0 0 var(--blue), inset 0 0 0 1px rgba(16, 185, 129, 0.35);
 }
 
 .pinnedSpacerRow {
@@ -591,7 +707,7 @@
   }
   .thead,
   .tr {
-    grid-template-columns: 52px 96px 1fr 3fr 76px 1fr 300px;
+    grid-template-columns: 52px 96px 1fr 3fr 76px 88px 300px;
   }
 }
 

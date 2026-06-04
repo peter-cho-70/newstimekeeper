@@ -1,7 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import './app.css'
-import type { Rundown, RundownItem, Template } from './domain/types'
-import { computeRundown, formatDelta, formatSeconds, parseTimeToSeconds } from './domain/time'
+import type { BudgetMode, Rundown, RundownItem, Template } from './domain/types'
+import {
+  addSecondsToClock,
+  computeBudgetSeconds,
+  computeRundown,
+  formatDelta,
+  formatSeconds,
+  parseTimeToSeconds,
+} from './domain/time'
 import { NEWS_ECONOMY_TEMPLATE, NEWS_EXTRA_TEMPLATE } from './templates'
 import { downloadJson, readJsonFile } from './domain/file'
 import { uid } from './domain/uid'
@@ -36,12 +43,61 @@ const STORAGE_KEY_PREFIX = 'newstimekeeper:rundown:v1:'
 const TEMPLATE_KEY_PREFIX = 'newstimekeeper:template:v1:'
 
 type PlayState = 'idle' | 'running' | 'paused'
+type AdvanceMode = 'auto' | 'manual'
+type ResumeAfterBack = { includedIndex: number; itemId: string }
 type PlaySession = {
   state: PlayState
   currentIncludedIndex: number
   itemStartedAtMs: number | null
   pausedAtMs: number | null
   pausedAccumulatedMs: number
+  // Per-item elapsed cache for "go back" behavior.
+  elapsedByItemIdMs: Record<string, number>
+  /** Duration (seconds) when the item started playing — for 초기 vs 실제 diff display. */
+  plannedDurationSecondsByItemId: Record<string, number>
+  newsStartedAtMs: number | null
+  /** Set when user steps back one item; next advance restores this item without committing the review item. */
+  resumeAfterBack: ResumeAfterBack | null
+}
+
+function idlePlaySession(): PlaySession {
+  return {
+    state: 'idle',
+    currentIncludedIndex: 0,
+    itemStartedAtMs: null,
+    pausedAtMs: null,
+    pausedAccumulatedMs: 0,
+    elapsedByItemIdMs: {},
+    plannedDurationSecondsByItemId: {},
+    newsStartedAtMs: null,
+    resumeAfterBack: null,
+  }
+}
+
+function snapshotPlannedDurationIfNeeded(
+  planned: Record<string, number>,
+  item: RundownItem | undefined,
+): Record<string, number> {
+  if (!item || (item.kind !== 'newsItem' && item.kind !== 'sectionHeader')) return planned
+  if (planned[item.id] != null) return planned
+  return { ...planned, [item.id]: item.durationSeconds }
+}
+
+function includedIndexOfItem(itemId: string, includedRows: Array<{ item: { id: string } }>): number {
+  return includedRows.findIndex((r) => r.item.id === itemId)
+}
+
+/** Items already passed in the included run order cannot be edited during play. */
+function isItemLockedDuringPlay(
+  itemId: string,
+  play: PlaySession,
+  includedRows: Array<{ item: { id: string } }>,
+): boolean {
+  if (play.state === 'idle') return false
+  const idx = includedIndexOfItem(itemId, includedRows)
+  if (idx < 0) return false
+  const curIdx = Math.min(play.currentIncludedIndex, Math.max(0, includedRows.length - 1))
+  return idx < curIdx
 }
 
 function storageKeyForRundown(programId: ProgramId) {
@@ -58,6 +114,45 @@ function nowClockHHMMSS() {
   const mm = String(d.getMinutes()).padStart(2, '0')
   const ss = String(d.getSeconds()).padStart(2, '0')
   return `${hh}:${mm}:${ss}`
+}
+
+/** Display-only: progress clocks run 1s ahead of measured elapsed. */
+const LIVE_PROGRESS_DISPLAY_OFFSET_SECONDS = 1
+
+function currentElapsedMsForPlaySession(now: number, p: PlaySession): number {
+  if (p.state === 'idle') return 0
+  const baseStartedAt = p.itemStartedAtMs ?? now
+  const effectiveNow = p.state === 'paused' ? p.pausedAtMs ?? now : now
+  return Math.max(0, effectiveNow - baseStartedAt - p.pausedAccumulatedMs)
+}
+
+function wallClockNewsElapsedSeconds(play: PlaySession, nowMs: number): number {
+  if (play.state === 'idle' || play.newsStartedAtMs == null) return 0
+  const effectiveNow = play.state === 'paused' ? play.pausedAtMs ?? nowMs : nowMs
+  return Math.max(0, Math.floor((effectiveNow - play.newsStartedAtMs - play.pausedAccumulatedMs) / 1000))
+}
+
+function displayedNewsProgressSeconds(play: PlaySession, nowMs: number): number {
+  if (play.state === 'idle') return 0
+  return wallClockNewsElapsedSeconds(play, nowMs) + LIVE_PROGRESS_DISPLAY_OFFSET_SECONDS
+}
+
+/** Measured item elapsed (no display offset) — for 편성 vs 진행 diff and projected end. */
+function rawItemElapsedSeconds(play: PlaySession, effectiveNowMs: number): number {
+  if (play.state === 'idle') return 0
+  return Math.floor(currentElapsedMsForPlaySession(effectiveNowMs, play) / 1000)
+}
+
+/** Positive = under planned duration; negative = over. */
+function plannedVsActualRemainingSeconds(plannedSeconds: number, actualElapsedSeconds: number): number {
+  return plannedSeconds - actualElapsedSeconds
+}
+
+function isEditableKeyboardTarget(target: EventTarget | null): boolean {
+  const t = target as HTMLElement | null
+  if (!t) return false
+  if (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT') return true
+  return t.isContentEditable
 }
 
 function toAsciiSlug(input: string): string {
@@ -95,22 +190,54 @@ function createEmptyRundown(p: Pick<ProgramDef, 'id' | 'name'>): Rundown {
     timing: {
       newsStartTime: '20:00:00',
       scheduledSeconds: 3060,
+      newsEndTime: '20:51:00',
+      budgetMode: 'scheduled',
+      autoStartAtNewsTime: true,
       toleranceSeconds: 15,
     },
     items: [marker],
   }
 }
 
+function defaultNewsEndTime(newsStartTime: string, scheduledSeconds: number): string {
+  return addSecondsToClock(newsStartTime, scheduledSeconds) || newsStartTime
+}
+
 function normalizeRundown(r: Rundown): Rundown {
+  const budgetMode: BudgetMode = r.timing?.budgetMode === 'endClock' ? 'endClock' : 'scheduled'
+  const newsStartTime = r.timing?.newsStartTime ?? '20:00:00'
+  const scheduledSeconds = typeof r.timing?.scheduledSeconds === 'number' ? r.timing.scheduledSeconds : 3060
+  const newsEndTime =
+    typeof r.timing?.newsEndTime === 'string' && r.timing.newsEndTime.trim()
+      ? r.timing.newsEndTime
+      : defaultNewsEndTime(newsStartTime, scheduledSeconds)
+
+  let timeAdjustSeen = false
+  const items = r.items.map((it) => {
+    if (it.kind === 'sectionHeader') {
+      const dur = typeof (it as any).durationSeconds === 'number' ? (it as any).durationSeconds : 0
+      return { ...it, durationSeconds: dur }
+    }
+    if (it.kind === 'newsItem') {
+      const raw = (it as { isTimeAdjust?: boolean }).isTimeAdjust === true
+      const isTimeAdjust = raw && !timeAdjustSeen
+      if (isTimeAdjust) timeAdjustSeen = true
+      return { ...it, isTimeAdjust }
+    }
+    return it
+  })
   return {
     ...r,
-    items: r.items.map((it) => {
-      if (it.kind === 'sectionHeader') {
-        const dur = typeof (it as any).durationSeconds === 'number' ? (it as any).durationSeconds : 0
-        return { ...it, durationSeconds: dur }
-      }
-      return it
-    }),
+    items,
+    timing: {
+      ...r.timing,
+      newsStartTime,
+      scheduledSeconds,
+      newsEndTime,
+      budgetMode,
+      autoStartAtNewsTime: r.timing?.autoStartAtNewsTime !== false,
+      toleranceSeconds: typeof r.timing?.toleranceSeconds === 'number' ? r.timing.toleranceSeconds : 15,
+    },
   }
 }
 
@@ -165,6 +292,9 @@ function cloneTemplateToRundown(template: Template): Rundown {
     timing: {
       newsStartTime: template.defaults.newsStartTime,
       scheduledSeconds: template.defaults.scheduledSeconds,
+      newsEndTime: defaultNewsEndTime(template.defaults.newsStartTime, template.defaults.scheduledSeconds),
+      budgetMode: 'scheduled',
+      autoStartAtNewsTime: true,
       toleranceSeconds: 15,
     },
     items,
@@ -181,16 +311,13 @@ function App() {
   const pinnedFooterRef = useRef<HTMLDivElement | null>(null)
   const [pinnedFooterHeight, setPinnedFooterHeight] = useState<number>(0)
   const [nowMs, setNowMs] = useState<number>(() => Date.now())
-  const [play, setPlay] = useState<PlaySession>({
-    state: 'idle',
-    currentIncludedIndex: 0,
-    itemStartedAtMs: null,
-    pausedAtMs: null,
-    pausedAccumulatedMs: 0,
-  })
+  const [play, setPlay] = useState<PlaySession>(() => idlePlaySession())
+  const [advanceMode, setAdvanceMode] = useState<AdvanceMode>('manual')
+  const autoStartLatchRef = useRef<string | null>(null)
 
   const [newsStartDraft, setNewsStartDraft] = useState<string>('20:00:00')
   const [scheduledDraft, setScheduledDraft] = useState<string>('51:00')
+  const [newsEndDraft, setNewsEndDraft] = useState<string>('20:51:00')
   const tableScrollRef = useRef<HTMLDivElement | null>(null)
 
   const [programs, setPrograms] = useState<ProgramDef[]>(() => {
@@ -244,12 +371,12 @@ function App() {
   }, [])
 
   useEffect(() => {
-    if (play.state === 'idle') return
+    const tickMs = play.state === 'idle' && rundown?.timing.autoStartAtNewsTime !== false ? 500 : 200
     const t = window.setInterval(() => {
       setNowMs(Date.now())
-    }, 200)
+    }, tickMs)
     return () => window.clearInterval(t)
-  }, [play.state])
+  }, [play.state, rundown?.timing.autoStartAtNewsTime])
 
   // Keep selected row visible in the scroll container
   useEffect(() => {
@@ -275,11 +402,22 @@ function App() {
   useEffect(() => {
     if (!rundown) return
     setNewsStartDraft(rundown.timing.newsStartTime)
-    setScheduledDraft(formatSeconds(rundown.timing.scheduledSeconds))
-  }, [rundown?.timing.newsStartTime, rundown?.timing.scheduledSeconds])
+    setNewsEndDraft(rundown.timing.newsEndTime)
+    if (rundown.timing.budgetMode === 'endClock') {
+      setScheduledDraft(formatSeconds(computeBudgetSeconds(rundown.timing)))
+    } else {
+      setScheduledDraft(formatSeconds(rundown.timing.scheduledSeconds))
+    }
+  }, [
+    rundown?.timing.newsStartTime,
+    rundown?.timing.scheduledSeconds,
+    rundown?.timing.newsEndTime,
+    rundown?.timing.budgetMode,
+  ])
 
   function moveSelected(delta: -1 | 1) {
-    if (!rundown || selectedIndex == null) return
+    if (!rundown || selectedIndex == null || !selectedItemId) return
+    if (isItemLockedDuringPlay(selectedItemId, play, includedRows)) return
     const idx = selectedIndex
     const target = idx + delta
     if (target < 0 || target >= rundown.items.length) return
@@ -295,7 +433,8 @@ function App() {
   }
 
   function takeOutToAfterEnd() {
-    if (!rundown || selectedIndex == null) return
+    if (!rundown || selectedIndex == null || !selectedItemId) return
+    if (isItemLockedDuringPlay(selectedItemId, play, includedRows)) return
     const idx = selectedIndex
     const cur = rundown.items[idx]
     if (!cur) return
@@ -319,7 +458,8 @@ function App() {
   }
 
   function putBackBeforeEnd() {
-    if (!rundown || selectedIndex == null) return
+    if (!rundown || selectedIndex == null || !selectedItemId) return
+    if (isItemLockedDuringPlay(selectedItemId, play, includedRows)) return
     const idx = selectedIndex
     const cur = rundown.items[idx]
     if (!cur) return
@@ -355,20 +495,6 @@ function App() {
     >
   }, [computed])
 
-  const elapsedRunSeconds = useMemo(() => {
-    if (play.state === 'idle') return 0
-    if (includedRows.length === 0) return 0
-    const idx = Math.min(play.currentIncludedIndex, includedRows.length - 1)
-    const completed = includedRows.slice(0, idx).reduce((acc, r) => acc + (r.item.durationSeconds ?? 0), 0)
-
-    const baseStartedAt = play.itemStartedAtMs ?? nowMs
-    const effectiveNow = play.state === 'paused' ? play.pausedAtMs ?? nowMs : nowMs
-    const elapsedMs = Math.max(0, effectiveNow - baseStartedAt - play.pausedAccumulatedMs)
-    const currentDur = includedRows[idx]?.item.durationSeconds ?? 0
-    const inCurrent = Math.min(currentDur, Math.floor(elapsedMs / 1000))
-    return completed + inCurrent
-  }, [includedRows, nowMs, play.currentIncludedIndex, play.itemStartedAtMs, play.pausedAccumulatedMs, play.pausedAtMs, play.state])
-
   const selectedRow = useMemo(() => {
     if (!computed || !selectedItemId) return null
     return computed.rows.find((r) => r.item.id === selectedItemId) ?? null
@@ -376,15 +502,17 @@ function App() {
 
   // Auto-advance engine
   useEffect(() => {
+    if (advanceMode !== 'auto') return
     if (play.state !== 'running') return
     const t = window.setInterval(() => {
       setPlay((prev) => {
         if (prev.state !== 'running') return prev
+        if (prev.resumeAfterBack) return prev
         const now = Date.now()
 
         // If we have nothing to play, stay idle
         if (includedRows.length === 0) {
-          return { ...prev, state: 'idle', currentIncludedIndex: 0, itemStartedAtMs: null, pausedAtMs: null, pausedAccumulatedMs: 0 }
+          return { ...idlePlaySession(), elapsedByItemIdMs: prev.elapsedByItemIdMs }
         }
 
         let idx = Math.min(prev.currentIncludedIndex, includedRows.length - 1)
@@ -398,7 +526,7 @@ function App() {
           idx += 1
           itemStartedAtMs = now
           if (idx >= includedRows.length) {
-            return { ...prev, state: 'idle', currentIncludedIndex: 0, itemStartedAtMs: null, pausedAtMs: null, pausedAccumulatedMs: 0 }
+            return { ...idlePlaySession(), elapsedByItemIdMs: prev.elapsedByItemIdMs }
           }
           guard += 1
         }
@@ -406,11 +534,29 @@ function App() {
         const dur = includedRows[idx]?.item.durationSeconds ?? 0
         const elapsedMs = Math.max(0, now - itemStartedAtMs - prev.pausedAccumulatedMs)
         if (dur > 0 && elapsedMs >= dur * 1000) {
+          // Cache elapsed for the item we are leaving (supports "go back" restore).
+          const leaving = includedRows[idx]?.item
+          const nextElapsedByItemIdMs =
+            leaving && leaving.id
+              ? { ...prev.elapsedByItemIdMs, [leaving.id]: Math.max(0, dur * 1000) }
+              : prev.elapsedByItemIdMs
           const nextIdx = idx + 1
           if (nextIdx >= includedRows.length) {
-            return { ...prev, state: 'idle', currentIncludedIndex: 0, itemStartedAtMs: null, pausedAtMs: null, pausedAccumulatedMs: 0 }
+            return {
+              ...idlePlaySession(),
+              elapsedByItemIdMs: nextElapsedByItemIdMs,
+            }
           }
-          return { ...prev, currentIncludedIndex: nextIdx, itemStartedAtMs: now, pausedAccumulatedMs: 0, pausedAtMs: null }
+          const nextItemId = includedRows[nextIdx]!.item.id
+          const savedElapsed = nextElapsedByItemIdMs[nextItemId] ?? 0
+          return {
+            ...prev,
+            currentIncludedIndex: nextIdx,
+            itemStartedAtMs: now - Math.max(0, savedElapsed),
+            pausedAccumulatedMs: 0,
+            pausedAtMs: null,
+            elapsedByItemIdMs: nextElapsedByItemIdMs,
+          }
         }
 
         if (idx !== prev.currentIncludedIndex || itemStartedAtMs !== prev.itemStartedAtMs) {
@@ -421,7 +567,7 @@ function App() {
       })
     }, 200)
     return () => window.clearInterval(t)
-  }, [play.state, includedRows])
+  }, [advanceMode, play.state, includedRows])
 
   function setRundownSafe(updater: (prev: Rundown) => Rundown) {
     setRundown((prev) => {
@@ -441,7 +587,7 @@ function App() {
       if (parsed?.programId !== pId) return false
       setProgramId(pId)
       setRundown(normalizeRundown(parsed))
-      setPlay({ state: 'idle', currentIncludedIndex: 0, itemStartedAtMs: null, pausedAtMs: null, pausedAccumulatedMs: 0 })
+      setPlay(idlePlaySession())
       return true
     } catch {
       return false
@@ -484,7 +630,7 @@ function App() {
       setProgramId(p.id)
       setRundown(rd)
       localStorage.setItem(storageKeyForRundown(p.id), JSON.stringify(rd))
-      setPlay({ state: 'idle', currentIncludedIndex: 0, itemStartedAtMs: null, pausedAtMs: null, pausedAccumulatedMs: 0 })
+      setPlay(idlePlaySession())
       setSelectedItemId(null)
       return
     }
@@ -497,7 +643,7 @@ function App() {
       setProgramId(p.id)
       setRundown(rd)
       localStorage.setItem(storageKeyForRundown(p.id), JSON.stringify(rd))
-      setPlay({ state: 'idle', currentIncludedIndex: 0, itemStartedAtMs: null, pausedAtMs: null, pausedAccumulatedMs: 0 })
+      setPlay(idlePlaySession())
       setSelectedItemId(null)
       return
     }
@@ -509,7 +655,7 @@ function App() {
       setProgramId(p.id)
       setRundown(rd)
       localStorage.setItem(storageKeyForRundown(p.id), JSON.stringify(rd))
-      setPlay({ state: 'idle', currentIncludedIndex: 0, itemStartedAtMs: null, pausedAtMs: null, pausedAccumulatedMs: 0 })
+      setPlay(idlePlaySession())
       setSelectedItemId(null)
       return
     }
@@ -519,7 +665,7 @@ function App() {
     setProgramId(p.id)
     setRundown(empty)
     localStorage.setItem(storageKeyForRundown(p.id), JSON.stringify(empty))
-    setPlay({ state: 'idle', currentIncludedIndex: 0, itemStartedAtMs: null, pausedAtMs: null, pausedAccumulatedMs: 0 })
+    setPlay(idlePlaySession())
     setSelectedItemId(null)
   }
 
@@ -532,7 +678,7 @@ function App() {
     const normalized = normalizeRundown(parsed)
     setRundown(normalized)
     localStorage.setItem(storageKeyForRundown(parsed.programId as ProgramId), JSON.stringify(normalized))
-    setPlay({ state: 'idle', currentIncludedIndex: 0, itemStartedAtMs: null, pausedAtMs: null, pausedAccumulatedMs: 0 })
+    setPlay(idlePlaySession())
     setSelectedItemId(null)
   }
 
@@ -575,7 +721,7 @@ function App() {
       // 현재 프로그램용 템플릿으로도 저장
       const savedTemplate: Template = { ...t, programId: targetPId, programName: targetName }
       localStorage.setItem(storageKeyForTemplate(targetPId), JSON.stringify(savedTemplate))
-      setPlay({ state: 'idle', currentIncludedIndex: 0, itemStartedAtMs: null, pausedAtMs: null, pausedAccumulatedMs: 0 })
+      setPlay(idlePlaySession())
       setSelectedItemId(null)
       return
     }
@@ -643,12 +789,18 @@ function App() {
         break
       }
     }
+    const startIncludedIdx = Math.min(firstIdx, Math.max(0, runnable.length - 1))
+    const firstItem = runnable[startIncludedIdx]
     setPlay({
       state: 'running',
-      currentIncludedIndex: Math.min(firstIdx, Math.max(0, runnable.length - 1)),
+      currentIncludedIndex: startIncludedIdx,
       itemStartedAtMs: now,
       pausedAtMs: null,
       pausedAccumulatedMs: 0,
+      elapsedByItemIdMs: {},
+      plannedDurationSecondsByItemId: snapshotPlannedDurationIfNeeded({}, firstItem),
+      newsStartedAtMs: now,
+      resumeAfterBack: null,
     })
     // start at top before auto-follow kicks in
     window.requestAnimationFrame(() => {
@@ -674,36 +826,136 @@ function App() {
     })
   }
 
-  function nextItemNow() {
+  function moveToIncludedIndex(
+    targetIncludedIndex: number,
+    opts?: { commitDuration?: boolean; resumeAfterBack?: ResumeAfterBack | null },
+  ) {
     const now = Date.now()
-    // If we are currently playing (or paused), "commit" actual elapsed time to the current item duration.
-    if (play.state !== 'idle' && includedRows.length > 0) {
-      const idx = Math.min(play.currentIncludedIndex, includedRows.length - 1)
-      const current = includedRows[idx]?.item
-      if (current && (current.kind === 'newsItem' || current.kind === 'sectionHeader')) {
-        const baseStartedAt = play.itemStartedAtMs ?? now
-        const effectiveNow = play.state === 'paused' ? play.pausedAtMs ?? now : now
-        const elapsedMs = Math.max(0, effectiveNow - baseStartedAt - play.pausedAccumulatedMs)
-        const elapsedSeconds = Math.max(0, Math.floor(elapsedMs / 1000))
-        const nextDuration = Math.max(0, elapsedSeconds)
-        setRundownSafe((prev) => ({
-          ...prev,
-          items: prev.items.map((x) =>
-            x.id === current.id && (x.kind === 'newsItem' || x.kind === 'sectionHeader') ? { ...x, durationSeconds: nextDuration } : x,
-          ),
-        }))
-      }
-    }
+    const commitDuration = opts?.commitDuration === true
 
     setPlay((prev) => {
       if (includedRows.length === 0) return prev
-      const next = Math.min(prev.currentIncludedIndex + 1, includedRows.length)
-      if (next >= includedRows.length) {
-        return { state: 'idle', currentIncludedIndex: 0, itemStartedAtMs: null, pausedAtMs: null, pausedAccumulatedMs: 0 }
+
+      const clamped = Math.max(0, Math.min(targetIncludedIndex, includedRows.length))
+      const returningToResume =
+        prev.resumeAfterBack != null && clamped === prev.resumeAfterBack.includedIndex
+
+      // Save current item's elapsed before switching.
+      let nextElapsedByItemIdMs = prev.elapsedByItemIdMs
+      if (prev.state !== 'idle' && includedRows.length > 0) {
+        const curIdx = Math.min(prev.currentIncludedIndex, includedRows.length - 1)
+        const cur = includedRows[curIdx]?.item
+        const isLeavingReviewForResume =
+          returningToResume && prev.resumeAfterBack != null && curIdx < prev.resumeAfterBack.includedIndex
+        if (cur && !isLeavingReviewForResume) {
+          const elapsedMs = currentElapsedMsForPlaySession(now, prev)
+          nextElapsedByItemIdMs = { ...nextElapsedByItemIdMs, [cur.id]: elapsedMs }
+          if (commitDuration && (cur.kind === 'newsItem' || cur.kind === 'sectionHeader')) {
+            const nextDuration = Math.max(0, Math.floor(elapsedMs / 1000))
+            setRundownSafe((r) => ({
+              ...r,
+              items: r.items.map((x) =>
+                x.id === cur.id && (x.kind === 'newsItem' || x.kind === 'sectionHeader') ? { ...x, durationSeconds: nextDuration } : x,
+              ),
+            }))
+          }
+        }
       }
-      return { ...prev, state: 'running', currentIncludedIndex: next, itemStartedAtMs: now, pausedAtMs: null, pausedAccumulatedMs: 0 }
+
+      const nextResumeAfterBack =
+        opts?.resumeAfterBack !== undefined ? opts.resumeAfterBack : prev.resumeAfterBack
+
+      if (clamped >= includedRows.length) {
+        return {
+          ...idlePlaySession(),
+          elapsedByItemIdMs: nextElapsedByItemIdMs,
+        }
+      }
+
+      const landingItem = includedRows[clamped]?.item
+      const nextPlannedDurationSecondsByItemId = snapshotPlannedDurationIfNeeded(
+        prev.plannedDurationSecondsByItemId,
+        landingItem,
+      )
+      const nextItemId = includedRows[clamped]!.item.id
+      const savedElapsed = nextElapsedByItemIdMs[nextItemId] ?? 0
+      const startedAt = now - Math.max(0, savedElapsed)
+      return {
+        ...prev,
+        state: 'running',
+        currentIncludedIndex: clamped,
+        itemStartedAtMs: startedAt,
+        pausedAtMs: null,
+        pausedAccumulatedMs: 0,
+        elapsedByItemIdMs: nextElapsedByItemIdMs,
+        plannedDurationSecondsByItemId: nextPlannedDurationSecondsByItemId,
+        resumeAfterBack: nextResumeAfterBack,
+      }
     })
   }
+
+  function nextItemNow() {
+    if (play.state === 'idle') return
+    if (play.resumeAfterBack) {
+      moveToIncludedIndex(play.resumeAfterBack.includedIndex, { commitDuration: false, resumeAfterBack: null })
+      return
+    }
+    moveToIncludedIndex(play.currentIncludedIndex + 1, { commitDuration: true })
+  }
+
+  function prevItemNow() {
+    if (play.state === 'idle' || play.resumeAfterBack) return
+    const curIdx = play.currentIncludedIndex
+    if (curIdx <= 0) return
+    const cur = includedRows[curIdx]?.item
+    if (!cur) return
+    moveToIncludedIndex(curIdx - 1, {
+      commitDuration: false,
+      resumeAfterBack: { includedIndex: curIdx, itemId: cur.id },
+    })
+  }
+
+  const startNewsNowRef = useRef(startNewsNow)
+  const nextItemNowRef = useRef(nextItemNow)
+  const togglePauseRef = useRef(togglePause)
+  startNewsNowRef.current = startNewsNow
+  nextItemNowRef.current = nextItemNow
+  togglePauseRef.current = togglePause
+
+  useEffect(() => {
+    autoStartLatchRef.current = null
+  }, [rundown?.timing.newsStartTime, rundown?.broadcastDate])
+
+  useEffect(() => {
+    if (!rundown || rundown.timing.autoStartAtNewsTime === false) return
+    if (play.state !== 'idle') return
+    const target = rundown.timing.newsStartTime
+    const now = nowClockHHMMSS()
+    const latchKey = `${rundown.broadcastDate}-${target}`
+    if (now === target && autoStartLatchRef.current !== latchKey) {
+      autoStartLatchRef.current = latchKey
+      startNewsNowRef.current()
+    }
+  }, [nowMs, rundown, play.state])
+
+  useEffect(() => {
+    if (!rundown) return
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.code !== 'Space' && e.key !== ' ') return
+      if (e.repeat) return
+      if (isEditableKeyboardTarget(e.target)) return
+      e.preventDefault()
+      if (play.state === 'idle') {
+        startNewsNowRef.current()
+      } else if (play.state === 'running') {
+        nextItemNowRef.current()
+      } else if (play.state === 'paused') {
+        togglePauseRef.current()
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [rundown, play.state])
 
   // Auto-follow: must be declared before any conditional return
   const currentPlayingIdForFollow =
@@ -837,9 +1089,20 @@ function App() {
     )
   }
 
-  const delta = computed.deltaSeconds
+  const budgetSeconds = computed.budgetSeconds
+  const isEndClockBudget = rundown.timing.budgetMode === 'endClock'
+  // 편성대비 = 뉴스합계 − 예산(편성시간 또는 끝−시작)
+  const scheduleDeltaSeconds = computed.deltaSeconds
+  const liveProgressSeconds = displayedNewsProgressSeconds(play, nowMs)
+  const liveBasisSeconds = play.state === 'idle' ? computed.includedTotalSeconds : liveProgressSeconds
+  const liveRemainingSeconds = budgetSeconds - liveBasisSeconds
+
   const currentPlayingId =
     play.state !== 'idle' && includedRows[play.currentIncludedIndex] ? includedRows[play.currentIncludedIndex]!.item.id : null
+  // IMPORTANT: Do not introduce hooks below the conditional return above.
+  // This derived value is cheap enough to compute inline.
+  const isSelectedItemLocked =
+    selectedItemId != null && isItemLockedDuringPlay(selectedItemId, play, includedRows)
 
   return (
     <div className="appShell">
@@ -850,27 +1113,47 @@ function App() {
         </div>
 
         <div className="metrics">
-          <div className="metric">
-            <div className="label">뉴스 시작</div>
+          <div className="metric metricNewsStart">
+            <div className="metricLabelRow">
+              <div className="label">뉴스 시작</div>
+              <label className="autoStartCheck" title="설정한 뉴스 시작 시각에 자동 재생">
+                <input
+                  type="checkbox"
+                  checked={rundown.timing.autoStartAtNewsTime !== false}
+                  onChange={(e) => {
+                    setRundownSafe((prev) => ({
+                      ...prev,
+                      timing: { ...prev.timing, autoStartAtNewsTime: e.target.checked },
+                    }))
+                  }}
+                />
+                <span>자동</span>
+              </label>
+            </div>
             <div className="value mono">{rundown.timing.newsStartTime}</div>
           </div>
           <div className="metric">
-            <div className="label">편성시간</div>
-            <div className="value mono">{formatSeconds(rundown.timing.scheduledSeconds)}</div>
+            <div className="label">진행시간</div>
+            <div className="value mono">{formatSeconds(liveProgressSeconds)}</div>
           </div>
           <div className="metric">
-            <div className="label">진행시간</div>
-            <div className="value mono">{formatSeconds(elapsedRunSeconds)}</div>
+            <div className="label">남은 시간</div>
+            <div className="value mono remainingAlways">{formatDelta(liveRemainingSeconds)}</div>
           </div>
           <div className="metric">
             <div className="label">편성대비</div>
-            <div className={delta < 0 ? 'value mono ok' : 'value mono bad'}>{formatDelta(delta)}</div>
+            <div className={scheduleDeltaSeconds < 0 ? 'value mono ok' : scheduleDeltaSeconds > 0 ? 'value mono bad' : 'value mono'}>
+              {formatDelta(scheduleDeltaSeconds)}
+            </div>
           </div>
         </div>
 
         <div className="topActions">
-          <span className="tag mono" title="뉴스끝 이전, includeInRun=true인 전체 아이템(뉴스+섹션) 합계">
-            합계 {formatSeconds(computed.includedTotalSeconds)}
+          <span className="tag mono newsTotalTag" title="뉴스끝 이전, includeInRun=true인 전체 아이템(뉴스+섹션) 합계">
+            <span className="tagMain">뉴스합계 {formatSeconds(computed.includedTotalSeconds)}</span>
+            <span className="tagSub">
+              {isEndClockBudget ? `끝 ${rundown.timing.newsEndTime}` : `편성 ${formatSeconds(budgetSeconds)}`}
+            </span>
           </span>
           <button
             className="btn subtle"
@@ -878,7 +1161,7 @@ function App() {
               setProgramId(null)
               setRundown(null)
               setSelectedItemId(null)
-              setPlay({ state: 'idle', currentIncludedIndex: 0, itemStartedAtMs: null, pausedAtMs: null, pausedAccumulatedMs: 0 })
+              setPlay(idlePlaySession())
             }}
             title="프로그램 선택 화면으로 나가기"
           >
@@ -926,7 +1209,7 @@ function App() {
               <div>기자</div>
               <div>제목</div>
               <div className="right">시작</div>
-              <div>비고</div>
+              <div className="right">남은 시간</div>
               <div className="right">조작</div>
             </div>
 
@@ -938,6 +1221,25 @@ function App() {
               const afterEnd = endIdx >= 0 ? rows.slice(endIdx + 1) : []
               const afterEndSlots = afterEnd.slice(0, 2)
 
+              const effectiveNowForItem = play.state === 'paused' ? play.pausedAtMs ?? nowMs : nowMs
+              const currentItemElapsedSeconds = rawItemElapsedSeconds(play, effectiveNowForItem)
+
+              const timeAdjustItemId =
+                rundown.items.find((x) => x.kind === 'newsItem' && x.isTimeAdjust)?.id ?? null
+              const plannedEndTime = computed.plannedEndTime
+              let projectedEndTime: string | null = null
+              if (play.state !== 'idle' && includedRows.length > 0) {
+                const curIdx = Math.min(play.currentIncludedIndex, includedRows.length - 1)
+                let projectedSeconds = 0
+                for (let i = 0; i < includedRows.length; i += 1) {
+                  const row = includedRows[i]!
+                  if (i < curIdx) projectedSeconds += row.item.durationSeconds ?? 0
+                  else if (i === curIdx) projectedSeconds += currentItemElapsedSeconds
+                  else projectedSeconds += row.item.durationSeconds ?? 0
+                }
+                projectedEndTime = addSecondsToClock(rundown.timing.newsStartTime, projectedSeconds)
+              }
+
               let displayNo = 0
               const renderRow = (row: (typeof rows)[number]) => {
                 const it = row.item
@@ -946,6 +1248,28 @@ function App() {
                 const start = row.startTime ?? null
                 const duration = it.kind === 'newsItem' || it.kind === 'sectionHeader' ? it.durationSeconds : 0
                 const isCurrent = currentPlayingId != null && it.id === currentPlayingId
+                const isTimeAdjust = it.kind === 'newsItem' && it.isTimeAdjust
+                const isLocked = isItemLockedDuringPlay(it.id, play, includedRows)
+                let displayRemainingSeconds: number | null = null
+                let displayRemainingTitle: string | undefined
+                if (it.kind === 'newsItem' || it.kind === 'sectionHeader') {
+                  const initialSec = play.plannedDurationSecondsByItemId[it.id]
+                  if (isCurrent && initialSec != null) {
+                    const actualSec = currentItemElapsedSeconds
+                    displayRemainingSeconds = plannedVsActualRemainingSeconds(initialSec, actualSec)
+                    displayRemainingTitle = `초기 ${formatSeconds(initialSec)} − 진행 ${formatSeconds(actualSec)}`
+                  } else if (isLocked && play.state !== 'idle' && initialSec != null) {
+                    const cachedMs = play.elapsedByItemIdMs[it.id]
+                    if (cachedMs != null) {
+                      const actualSec = Math.floor(cachedMs / 1000)
+                      displayRemainingSeconds = plannedVsActualRemainingSeconds(initialSec, actualSec)
+                      displayRemainingTitle = `초기 ${formatSeconds(initialSec)} − 진행 ${formatSeconds(actualSec)}`
+                    }
+                  }
+                }
+                const showDurationEditor =
+                  (it.kind === 'newsItem' || it.kind === 'sectionHeader') &&
+                  (timeAdjustItemId == null || it.id === timeAdjustItemId)
                 const emphasis = it.kind === 'newsItem' ? it.isEmphasis : false
                 const selected = selectedItemId != null && it.id === selectedItemId
 
@@ -964,7 +1288,9 @@ function App() {
                       isAfterEnd ? 'afterEnd' : '',
                       isCurrent ? 'current' : '',
                       emphasis ? 'emphasis' : '',
+                      isTimeAdjust ? 'timeAdjust' : '',
                       selected ? 'selected' : '',
+                      isLocked ? 'locked' : '',
                     ].join(' ')}
                     onMouseDown={() => setSelectedItemId(it.id)}
                   >
@@ -974,6 +1300,8 @@ function App() {
                         <select
                           className="select"
                           value={it.category}
+                          disabled={isLocked}
+                          title={isLocked ? '진행 완료 — 편집 불가' : undefined}
                           onChange={(e) => {
                             const v = e.target.value
                             setRundownSafe((prev) => ({
@@ -999,6 +1327,8 @@ function App() {
                         <input
                           className="input"
                           value={it.reporter}
+                          disabled={isLocked}
+                          title={isLocked ? '진행 완료 — 편집 불가' : undefined}
                           onChange={(e) => {
                             const v = e.target.value
                             setRundownSafe((prev) => ({
@@ -1020,6 +1350,8 @@ function App() {
                             className="input"
                             id={`title-${it.id}`}
                             value={it.title}
+                            disabled={isLocked}
+                            title={isLocked ? '진행 완료 — 편집 불가' : undefined}
                             onChange={(e) => {
                               const v = e.target.value
                               setRundownSafe((prev) => ({
@@ -1042,6 +1374,8 @@ function App() {
                             className="input"
                             id={`title-${it.id}`}
                             value={it.title}
+                            disabled={isLocked}
+                            title={isLocked ? '진행 완료 — 편집 불가' : undefined}
                             onChange={(e) => {
                               const v = e.target.value
                               setRundownSafe((prev) => ({
@@ -1061,25 +1395,45 @@ function App() {
                       )}
                     </div>
 
-                    <div className="right mono">{start ? start : ''}</div>
-                    <div>
-                      {it.kind === 'newsItem' ? (
-                        <input
-                          className="input"
-                          value={it.notes}
-                          onChange={(e) => {
-                            const v = e.target.value
-                            setRundownSafe((prev) => ({
-                              ...prev,
-                              items: prev.items.map((x) =>
-                                x.id === it.id && x.kind === 'newsItem' ? { ...x, notes: v } : x,
-                              ),
-                            }))
-                          }}
-                        />
+                    <div className="right mono">
+                      {isMarkerEnd ? (
+                        <div className="endTimeStack">
+                          <div className="endTimeLine" title="큐시트 합계 기준 예정 끝">
+                            <span className="endTimeLabel">예정</span> {plannedEndTime}
+                          </div>
+                          {projectedEndTime && projectedEndTime !== plannedEndTime ? (
+                            <div className="endTimeLine projected" title="현재 진행 반영 예상 끝">
+                              <span className="endTimeLabel">예상</span> {projectedEndTime}
+                            </div>
+                          ) : null}
+                          {play.state === 'idle' && isEndClockBudget ? (
+                            <div className="endTimeLine target" title="목표 끝 시각">
+                              <span className="endTimeLabel">목표</span> {rundown.timing.newsEndTime}
+                            </div>
+                          ) : null}
+                        </div>
+                      ) : start ? (
+                        start
                       ) : (
                         ''
                       )}
+                    </div>
+                    <div
+                      className={[
+                        'right',
+                        'mono',
+                        'itemRemainingCell',
+                        displayRemainingSeconds != null
+                          ? displayRemainingSeconds > 0
+                            ? 'ok'
+                            : displayRemainingSeconds < 0
+                              ? 'bad'
+                              : ''
+                          : '',
+                      ].join(' ')}
+                      title={displayRemainingTitle}
+                    >
+                      {displayRemainingSeconds != null ? formatDelta(displayRemainingSeconds) : ''}
                     </div>
                     <div className="right">
                       <div className="actions">
@@ -1088,6 +1442,7 @@ function App() {
                             <input
                               type="checkbox"
                               checked={it.isEmphasis}
+                              disabled={isLocked}
                               onChange={(e) => {
                                 const checked = e.target.checked
                                 setRundownSafe((prev) => ({
@@ -1100,10 +1455,31 @@ function App() {
                             />
                           </label>
                         ) : null}
-                        {it.kind === 'newsItem' || it.kind === 'sectionHeader' ? (
+                        {it.kind === 'newsItem' ? (
+                          <label className="emChk" title="시간조절(편성 맞추기, 1개만)">
+                            <input
+                              type="checkbox"
+                              checked={it.isTimeAdjust}
+                              disabled={isLocked}
+                              onChange={(e) => {
+                                const checked = e.target.checked
+                                setRundownSafe((prev) => ({
+                                  ...prev,
+                                  items: prev.items.map((x) => {
+                                    if (x.kind !== 'newsItem') return x
+                                    return { ...x, isTimeAdjust: x.id === it.id ? checked : false }
+                                  }),
+                                }))
+                              }}
+                            />
+                          </label>
+                        ) : null}
+                        {showDurationEditor ? (
                           <DurationEditor
                             valueSeconds={duration}
+                            disabled={isLocked}
                             onDelta={(d) => {
+                              if (isLocked) return
                               setRundownSafe((prev) => ({
                                 ...prev,
                                 items: prev.items.map((x) =>
@@ -1118,8 +1494,16 @@ function App() {
                         {it.kind === 'newsItem' ? (
                           <button
                             className="iconBtn"
-                            title={it.includeInRun && !isAfterEnd ? '진행 제외' : '진행 포함'}
+                            disabled={isLocked}
+                            title={
+                              isLocked
+                                ? '진행 완료 — 편집 불가'
+                                : it.includeInRun && !isAfterEnd
+                                  ? '진행 제외'
+                                  : '진행 포함'
+                            }
                             onClick={() => {
+                              if (isLocked) return
                               setRundownSafe((prev) => ({
                                 ...prev,
                                 items: prev.items.map((x) =>
@@ -1133,8 +1517,16 @@ function App() {
                         ) : it.kind === 'sectionHeader' ? (
                           <button
                             className="iconBtn"
-                            title={it.includeInRun && !isAfterEnd ? '시간계산 제외' : '시간계산 포함'}
+                            disabled={isLocked}
+                            title={
+                              isLocked
+                                ? '진행 완료 — 편집 불가'
+                                : it.includeInRun && !isAfterEnd
+                                  ? '시간계산 제외'
+                                  : '시간계산 포함'
+                            }
                             onClick={() => {
+                              if (isLocked) return
                               setRundownSafe((prev) => ({
                                 ...prev,
                                 items: prev.items.map((x) =>
@@ -1149,8 +1541,10 @@ function App() {
                         {!isMarkerEnd ? (
                           <button
                             className="iconBtn danger"
-                            title="삭제"
+                            disabled={isLocked}
+                            title={isLocked ? '진행 완료 — 편집 불가' : '삭제'}
                             onClick={() => {
+                              if (isLocked) return
                               setRundownSafe((prev) => ({
                                 ...prev,
                                 items: prev.items.filter((x) => x.id !== it.id),
@@ -1199,7 +1593,7 @@ function App() {
                       <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
                         <button
                           className="btn subtle"
-                          disabled={!selectedItemId}
+                          disabled={!selectedItemId || isSelectedItemLocked}
                           onClick={() => moveSelected(-1)}
                           title="선택한 아이템 위로"
                         >
@@ -1207,7 +1601,7 @@ function App() {
                         </button>
                         <button
                           className="btn subtle"
-                          disabled={!selectedItemId}
+                          disabled={!selectedItemId || isSelectedItemLocked}
                           onClick={() => moveSelected(1)}
                           title="선택한 아이템 아래로"
                         >
@@ -1215,7 +1609,7 @@ function App() {
                         </button>
                         <button
                           className="btn subtle"
-                          disabled={!selectedItemId || !!selectedRow?.isAfterEnd}
+                          disabled={!selectedItemId || !!selectedRow?.isAfterEnd || isSelectedItemLocked}
                           onClick={takeOutToAfterEnd}
                           title="뉴스끝 아래로 빼기(시간계산 제외)"
                         >
@@ -1242,6 +1636,7 @@ function App() {
                               notes: '',
                               isDefaultItem: false,
                               isEmphasis: false,
+                              isTimeAdjust: false,
                               includeInRun: true,
                               flags: [],
                             }
@@ -1296,9 +1691,38 @@ function App() {
                         >
                           {play.state === 'idle' ? '뉴스시작' : play.state === 'paused' ? '재개' : '포즈'}
                         </button>
-                        <button className="btn bigNextBtn" onClick={nextItemNow} disabled={play.state === 'idle'} title="다음 아이템으로">
-                          다음 아이템
+                        <button
+                          className="btn subtle"
+                          onClick={prevItemNow}
+                          disabled={play.state === 'idle' || play.currentIncludedIndex <= 0 || play.resumeAfterBack != null}
+                          title={
+                            play.resumeAfterBack
+                              ? '한 번만 뒤로 갈 수 있습니다. 다음으로 원래 아이템 복귀'
+                              : '이전 아이템으로 (1칸)'
+                          }
+                        >
+                          이전 아이템
                         </button>
+                        <button
+                          className="btn bigNextBtn"
+                          onClick={nextItemNow}
+                          disabled={play.state === 'idle'}
+                          title={play.resumeAfterBack ? '원래 진행 아이템으로 복귀' : '다음 아이템으로'}
+                        >
+                          {play.resumeAfterBack ? '원래 아이템' : '다음 아이템'}
+                        </button>
+                        <label className="field">
+                          <span className="fieldLabel">진행모드</span>
+                          <select
+                            className="select"
+                            value={advanceMode}
+                            onChange={(e) => setAdvanceMode(e.target.value === 'manual' ? 'manual' : 'auto')}
+                            title={advanceMode === 'auto' ? '시간이 끝나면 자동으로 다음으로 이동' : '다음 아이템을 눌러야 이동'}
+                          >
+                            <option value="auto">자동</option>
+                            <option value="manual">수동</option>
+                          </select>
+                        </label>
                         <label className="field">
                           <span className="fieldLabel">뉴스 시작</span>
                           <input
@@ -1320,10 +1744,29 @@ function App() {
                           />
                         </label>
                         <label className="field">
+                          <span className="fieldLabel">예산 기준</span>
+                          <select
+                            className="select"
+                            value={rundown.timing.budgetMode}
+                            onChange={(e) => {
+                              const budgetMode = e.target.value === 'endClock' ? 'endClock' : 'scheduled'
+                              setRundownSafe((prev) => ({
+                                ...prev,
+                                timing: { ...prev.timing, budgetMode },
+                              }))
+                            }}
+                          >
+                            <option value="scheduled">편성시간</option>
+                            <option value="endClock">뉴스끝 시각</option>
+                          </select>
+                        </label>
+                        <label className="field">
                           <span className="fieldLabel">편성(mm:ss)</span>
                           <input
                             className="input mono"
                             value={scheduledDraft}
+                            disabled={isEndClockBudget}
+                            title={isEndClockBudget ? '뉴스끝 시각 기준일 때는 끝−시작으로 자동 계산됩니다' : undefined}
                             onChange={(e) => {
                               setScheduledDraft(e.target.value)
                             }}
@@ -1331,6 +1774,7 @@ function App() {
                               e.currentTarget.select()
                             }}
                             onBlur={() => {
+                              if (isEndClockBudget) return
                               const secs = parseTimeToSeconds(scheduledDraft)
                               if (secs == null) {
                                 setScheduledDraft(formatSeconds(rundown.timing.scheduledSeconds))
@@ -1338,7 +1782,34 @@ function App() {
                               }
                               setRundownSafe((prev) => ({
                                 ...prev,
-                                timing: { ...prev.timing, scheduledSeconds: secs },
+                                timing: {
+                                  ...prev.timing,
+                                  scheduledSeconds: secs,
+                                  newsEndTime: defaultNewsEndTime(prev.timing.newsStartTime, secs),
+                                },
+                              }))
+                            }}
+                          />
+                        </label>
+                        <label className="field">
+                          <span className="fieldLabel">뉴스끝</span>
+                          <input
+                            className="input mono"
+                            value={newsEndDraft}
+                            disabled={!isEndClockBudget}
+                            title={!isEndClockBudget ? '예산 기준을 뉴스끝 시각으로 바꾸면 입력할 수 있습니다' : undefined}
+                            onChange={(e) => {
+                              setNewsEndDraft(e.target.value)
+                            }}
+                            onFocus={(e) => {
+                              e.currentTarget.select()
+                            }}
+                            onBlur={() => {
+                              if (!isEndClockBudget) return
+                              const v = newsEndDraft.trim()
+                              setRundownSafe((prev) => ({
+                                ...prev,
+                                timing: { ...prev.timing, newsEndTime: v },
                               }))
                             }}
                           />
@@ -1382,22 +1853,24 @@ function insertBeforeMarkerEnd(items: RundownItem[], newItem: RundownItem): Rund
 
 function DurationEditor(props: {
   valueSeconds: number
+  disabled?: boolean
   onDelta: (deltaSeconds: number) => void
 }) {
+  const disabled = props.disabled === true
   return (
     <div className="dur">
       <div className="durBtns">
-        <button className="miniBtn" onClick={() => props.onDelta(-5)}>
-          -5
-        </button>
-        <button className="miniBtn" onClick={() => props.onDelta(1)} title="+1초">
+        <button className="miniBtn" disabled={disabled} onClick={() => props.onDelta(1)} title="+1초">
           +1
         </button>
-        <button className="miniBtn" onClick={() => props.onDelta(5)}>
+        <button className="miniBtn" disabled={disabled} onClick={() => props.onDelta(5)}>
           +5
         </button>
-        <button className="miniBtn" onClick={() => props.onDelta(10)}>
+        <button className="miniBtn" disabled={disabled} onClick={() => props.onDelta(10)}>
           +10
+        </button>
+        <button className="miniBtn" disabled={disabled} onClick={() => props.onDelta(-5)}>
+          -5
         </button>
       </div>
     </div>
